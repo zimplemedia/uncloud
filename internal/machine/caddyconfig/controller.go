@@ -60,7 +60,7 @@ func (c *Controller) Run(ctx context.Context) error {
 	}
 	c.log.Info("Subscribed to container changes in the cluster to generate Caddy configuration.")
 
-	containers = filterHealthyContainers(containers)
+	containers = c.filterHealthyContainers(ctx, containers)
 	c.generateAndLoadCaddyfile(ctx, containers)
 
 	// TODO: left for backward compatibility, remove later.
@@ -81,7 +81,7 @@ func (c *Controller) Run(ctx context.Context) error {
 				c.log.Error("Failed to list containers.", "err", err)
 				continue
 			}
-			containers = filterHealthyContainers(containers)
+			containers = c.filterHealthyContainers(ctx, containers)
 			c.generateAndLoadCaddyfile(ctx, containers)
 
 			// TODO: left for backward compatibility, remove later.
@@ -94,15 +94,38 @@ func (c *Controller) Run(ctx context.Context) error {
 	}
 }
 
-// filterHealthyContainers filters out containers that are not healthy.
-// TODO: Filters out containers from this machine that are likely unavailable. The availability can be determined
-// by the cluster membership state of the machine that the container is running on. Implement machine membership
-// check using Corrossion Admin client.
-func filterHealthyContainers(containers []store.ContainerRecord) []store.ContainerRecord {
+// filterHealthyContainers filters out containers that are not healthy or belong to machines
+// that are no longer in the cluster.
+func (c *Controller) filterHealthyContainers(ctx context.Context, containers []store.ContainerRecord) []store.ContainerRecord {
+	// Get list of active machines in the cluster
+	machines, err := c.store.ListMachines(ctx)
+	if err != nil {
+		c.log.Error("Failed to list machines for filtering containers, using all containers.", "err", err)
+		// Fall back to only filtering by health if we can't get the machine list
+		healthy := make([]store.ContainerRecord, 0, len(containers))
+		for _, cr := range containers {
+			if cr.Container.Healthy() {
+				healthy = append(healthy, cr)
+			}
+		}
+		return healthy
+	}
+
+	// Build a set of active machine IDs for fast lookup
+	activeMachines := make(map[string]bool, len(machines))
+	for _, m := range machines {
+		activeMachines[m.Id] = true
+	}
+
+	// Filter containers: must be healthy AND belong to an active machine
 	healthy := make([]store.ContainerRecord, 0, len(containers))
 	for _, cr := range containers {
-		if cr.Container.Healthy() {
+		if cr.Container.Healthy() && activeMachines[cr.MachineID] {
 			healthy = append(healthy, cr)
+		} else if !activeMachines[cr.MachineID] {
+			c.log.Debug("Filtering out container from removed machine.",
+				"container_id", cr.Container.ID,
+				"machine_id", cr.MachineID)
 		}
 	}
 	return healthy

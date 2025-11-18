@@ -16,7 +16,7 @@ import (
 
 const (
 	// TODO: support pinning the script version to the CLI version.
-	installScriptURL = "https://raw.githubusercontent.com/psviderski/uncloud/refs/heads/main/scripts/install.sh"
+	installScriptURL = "https://raw.githubusercontent.com/zimplemedia/uncloud/refs/heads/main/scripts/install.sh"
 	rootUser         = "root"
 )
 
