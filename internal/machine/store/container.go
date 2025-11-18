@@ -162,6 +162,23 @@ func (s *Store) DeleteContainers(ctx context.Context, opts DeleteOptions) error 
 	return nil
 }
 
+// DeleteContainersByMachine deletes all container records associated with the given machine ID.
+func (s *Store) DeleteContainersByMachine(ctx context.Context, machineID string) error {
+	if machineID == "" {
+		return fmt.Errorf("machine ID cannot be empty")
+	}
+
+	res, err := s.corro.ExecContext(ctx, "DELETE FROM containers WHERE machine_id = ?", machineID)
+	if err != nil {
+		return fmt.Errorf("delete containers by machine_id: %w", err)
+	}
+	if res.RowsAffected > 0 {
+		slog.Debug("Container records deleted from store DB by machine.", "machine_id", machineID, "count", res.RowsAffected)
+	}
+
+	return nil
+}
+
 // SubscribeContainers returns a list of containers and a channel that signals changes to the list. The channel doesn't
 // receive any values, it just signals when a container(s) has been added, updated, or deleted in the database.
 func (s *Store) SubscribeContainers(ctx context.Context) ([]ContainerRecord, <-chan struct{}, error) {

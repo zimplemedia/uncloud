@@ -337,6 +337,12 @@ func (c *Cluster) RemoveMachine(ctx context.Context, req *pb.RemoveMachineReques
 		return nil, status.Error(codes.InvalidArgument, "machine ID not set")
 	}
 
+	// Remove all container records for the machine from the cluster store to avoid stale upstreams
+	// in components that rely on container state (e.g. Caddy config generation).
+	if err := c.store.DeleteContainersByMachine(ctx, req.Id); err != nil {
+		return nil, status.Errorf(codes.Internal, "delete machine containers from store: %v", err)
+	}
+
 	if err := c.store.DeleteMachine(ctx, req.Id); err != nil {
 		if errors.Is(err, store.ErrMachineNotFound) {
 			return nil, status.Errorf(codes.NotFound, "machine not found: %s", req.Id)
