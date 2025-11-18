@@ -1,5 +1,23 @@
 # Release v0.1.1
 
+## Features
+
+### Zero-downtime deployment with healthcheck waiting
+
+**Problem:** During deployments, Uncloud starts new containers and immediately stops old ones, causing brief service interruptions (502 errors) because new containers may not be ready to serve traffic.
+
+**Solution:** Wait for new containers to become healthy before stopping old containers.
+
+**Changes:**
+- Added `waitForContainerHealthy()` method to wait for containers to become healthy
+- Modified `RunContainerOperation.Execute()` to wait for healthcheck before stopping old containers
+- Poll interval: 2s, Max wait: 90s
+- Handle containers without healthcheck (5s crash detection)
+
+**Impact:** Eliminates 502 errors during deployments, tested on staging with 0% downtime (previously 1-2%).
+
+---
+
 ## Fixes
 
 ### Critical: Prevent stale container upstreams in Caddy config
@@ -21,6 +39,8 @@
 - `scripts/install.sh`: Updated GitHub URLs to point to zimplemedia/uncloud fork
 
 **Impact:** Eliminates 502 errors after machine removal, ensures Caddy only routes to healthy upstreams on active machines.
+
+---
 
 ## Breaking Changes
 
