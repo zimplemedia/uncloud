@@ -22,7 +22,6 @@ import (
 type removeOptions struct {
 	noReset bool
 	yes     bool
-	context string
 }
 
 func NewRmCommand() *cobra.Command {
@@ -39,8 +38,6 @@ func NewRmCommand() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVarP(&opts.context, "context", "c", "",
-		"Name of the cluster context. (default is the current context)")
 	cmd.Flags().BoolVarP(&opts.yes, "yes", "y", false,
 		"Do not prompt for confirmation before removing the machine.")
 	cmd.Flags().BoolVar(&opts.noReset, "no-reset", false,
@@ -51,14 +48,14 @@ func NewRmCommand() *cobra.Command {
 
 func remove(ctx context.Context, uncli *cli.CLI, nameOrID string, opts removeOptions) error {
 	// TODO: automatically choose a connection to the machine that is not being removed.
-	client, err := uncli.ConnectCluster(ctx, opts.context)
+	client, err := uncli.ConnectCluster(ctx)
 	if err != nil {
 		return fmt.Errorf("connect to cluster: %w", err)
 	}
 	defer client.Close()
 
 	// Verify the machine exists and list all service containers on it including stopped ones.
-	mctx, machines, err := api.ProxyMachinesContext(ctx, client, []string{nameOrID})
+	mctx, machines, err := client.ProxyMachinesContext(ctx, []string{nameOrID})
 	if err != nil {
 		return err
 	}
@@ -155,8 +152,21 @@ func remove(ctx context.Context, uncli *cli.CLI, nameOrID string, opts removeOpt
 		}
 	}
 
-	// TODO: remove the connection to the machine from the uncloud config if it exists. We need a way to associate
-	//  the machine with its connection in the config, e.g. by storing the machine name in the connection metadata.
+	// Remove the connection to the machine from the uncloud config if it exists.
+	if uncli.Config != nil {
+		contextName := uncli.GetContextOverrideOrCurrent()
+		if context, ok := uncli.Config.Contexts[contextName]; ok {
+			for i, c := range context.Connections {
+				if c.MachineID == m.Id {
+					context.Connections = slices.Delete(context.Connections, i, i+1)
+					break
+				}
+			}
+			if err := uncli.Config.Save(); err != nil {
+				return fmt.Errorf("save config: %w", err)
+			}
+		}
+	}
 
 	// TODO: If Caddy was running on this machine and a cluster domain is reserved,
 	//  let the user know that the DNS records should be updated.

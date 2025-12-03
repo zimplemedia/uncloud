@@ -11,7 +11,6 @@ import (
 
 type rmOptions struct {
 	services []string
-	context  string
 }
 
 func NewRmCommand() *cobra.Command {
@@ -20,22 +19,23 @@ func NewRmCommand() *cobra.Command {
 		Use:     "rm SERVICE [SERVICE...]",
 		Aliases: []string{"remove", "delete"},
 		Short:   "Remove one or more services.",
-		Args:    cobra.MinimumNArgs(1),
+		Long: `Remove one or more services.
+
+The volumes used by the services are preserved and should be removed separately
+with 'uc volume rm'. Anonymous Docker volumes (automatically created from VOLUME
+directives in image Dockerfiles) are automatically removed with their containers.`,
+		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			uncli := cmd.Context().Value("cli").(*cli.CLI)
 			opts.services = args
 			return rm(cmd.Context(), uncli, opts)
 		},
 	}
-	cmd.Flags().StringVarP(
-		&opts.context, "context", "c", "",
-		"Name of the cluster context. (default is the current context)",
-	)
 	return cmd
 }
 
 func rm(ctx context.Context, uncli *cli.CLI, opts rmOptions) error {
-	client, err := uncli.ConnectCluster(ctx, opts.context)
+	client, err := uncli.ConnectCluster(ctx)
 	if err != nil {
 		return fmt.Errorf("connect to cluster: %w", err)
 	}

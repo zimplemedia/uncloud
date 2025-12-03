@@ -62,7 +62,7 @@ This command looks for a Compose file in your current working directory and:
 5. **Deploys service containers** using the built images and latest configuration changes with zero-downtime rolling
    updates
 
-See the [uc deploy](../../9-cli-reference/uc_deploy.md) reference for all available options.
+See the [`uc deploy` ](../../9-cli-reference/uc_deploy.md) reference for all available options.
 
 Watch `uc deploy` building and deploying a demo app (18 seconds):
 
@@ -98,9 +98,10 @@ You can pass additional build arguments or override existing ones using the `--b
 uc deploy --build-arg BUILD_ENV=dev
 ```
 
-You can also use advanced features like build caches, secrets, and SSH access.
+You can also use advanced features like build caches or SSH access.
 See [Compose Build Specification](https://github.com/compose-spec/compose-spec/blob/main/build.md) for all supported
-attributes.
+attributes. Note that build [secrets](https://github.com/compose-spec/compose-spec/blob/main/build.md#secrets) are not
+supported though.
 
 :::info note
 
@@ -140,8 +141,8 @@ This generates tags like:
 `uc deploy` renders the image templates when it loads the Compose file and then uses the resulting names for the build
 and deploy stages.
 
-See the [Image tag template](../../8-compose-file-reference/2-image-tag-template.md) reference for all available template
-variables and functions.
+See the [Image tag template](../../8-compose-file-reference/2-image-tag-template.md) reference for all available
+template variables and functions.
 
 ### Separate build and deploy steps
 

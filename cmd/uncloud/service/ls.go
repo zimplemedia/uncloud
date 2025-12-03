@@ -4,33 +4,30 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"text/tabwriter"
 
 	"github.com/psviderski/uncloud/internal/cli"
+	"github.com/psviderski/uncloud/pkg/api"
 	"github.com/spf13/cobra"
 )
 
 func NewListCommand() *cobra.Command {
-	var contextName string
 	cmd := &cobra.Command{
 		Use:     "ls",
 		Aliases: []string{"list"},
 		Short:   "List services.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			uncli := cmd.Context().Value("cli").(*cli.CLI)
-			return list(cmd.Context(), uncli, contextName)
+			return list(cmd.Context(), uncli)
 		},
 	}
-	cmd.Flags().StringVarP(
-		&contextName, "context", "c", "",
-		"Name of the cluster context. (default is the current context)",
-	)
 	return cmd
 }
 
-func list(ctx context.Context, uncli *cli.CLI, contextName string) error {
-	client, err := uncli.ConnectCluster(ctx, contextName)
+func list(ctx context.Context, uncli *cli.CLI) error {
+	client, err := uncli.ConnectCluster(ctx)
 	if err != nil {
 		return fmt.Errorf("connect to cluster: %w", err)
 	}
@@ -41,15 +38,15 @@ func list(ctx context.Context, uncli *cli.CLI, contextName string) error {
 		return fmt.Errorf("list services: %w", err)
 	}
 
-	serviceNames := make(map[string]struct{}, len(services))
+	// Sort services by name.
 	haveDuplicateNames := false
-	for _, svc := range services {
-		if _, exists := serviceNames[svc.Name]; exists {
+	slices.SortFunc(services, func(a, b api.Service) int {
+		if a.Name == b.Name {
 			haveDuplicateNames = true
-			break
+			return strings.Compare(a.ID, b.ID)
 		}
-		serviceNames[svc.Name] = struct{}{}
-	}
+		return strings.Compare(a.Name, b.Name)
+	})
 
 	// Print the list of services in a table format.
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
