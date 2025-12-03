@@ -1,4 +1,4 @@
-# Release v0.1.1
+# Release v0.14.1
 
 ## Features
 
@@ -9,6 +9,7 @@
 **Solution:** Wait for new containers to become healthy before stopping old containers.
 
 **Changes:**
+
 - Added `waitForContainerHealthy()` method to wait for containers to become healthy
 - Modified `RunContainerOperation.Execute()` to wait for healthcheck before stopping old containers
 - Poll interval: 2s, Max wait: 90s
@@ -32,6 +33,7 @@
 2. **Caddy controller filtering** - Filter out containers belonging to machines that no longer exist in the cluster before generating Caddy config
 
 **Changes:**
+
 - `internal/machine/cluster/cluster.go`: Added container cleanup in `RemoveMachine()`
 - `internal/machine/store/container.go`: Added `DeleteContainersByMachine()` method
 - `internal/machine/caddyconfig/controller.go`: Enhanced `filterHealthyContainers()` to check machine existence
@@ -49,19 +51,21 @@ None
 ## Upgrade Instructions
 
 ### For new deployments:
+
 ```bash
-# Will automatically download v0.1.1
+# Will automatically download v0.14.1
 uc machine init user@host
 uc machine add user@host
 ```
 
 ### For existing machines:
+
 ```bash
 # Download and install the new uc CLI locally
-curl -fsSL https://github.com/zimplemedia/uncloud/releases/download/v0.1.1/uc_darwin_arm64.tar.gz | tar -xz
+curl -fsSL https://github.com/zimplemedia/uncloud/releases/download/v0.14.1/uc_darwin_arm64.tar.gz | tar -xz
 sudo install uc /usr/local/bin/uc
 
 # Update uncloudd on each machine
 uc machine ls  # Get list of machines
-ssh root@<machine> 'curl -fsSL https://github.com/zimplemedia/uncloud/releases/download/v0.1.1/uncloudd_linux_amd64.tar.gz | tar -xz && install uncloudd /usr/local/bin/uncloudd && systemctl restart uncloud'
+ssh root@<machine> 'curl -fsSL https://github.com/zimplemedia/uncloud/releases/download/v0.14.1/uncloudd_linux_amd64.tar.gz | tar -xz && install uncloudd /usr/local/bin/uncloudd && systemctl restart uncloud'
 ```
