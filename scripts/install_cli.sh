@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-GITHUB_REPO="psviderski/uncloud"
+GITHUB_REPO="zimplemedia/uncloud"
 INSTALL_DIR=${INSTALL_DIR:-/usr/local/bin}
 # Use the latest version or specify the version to install:
 #   curl ... | VERSION=v1.2.3 sh
