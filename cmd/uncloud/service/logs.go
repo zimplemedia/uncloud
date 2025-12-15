@@ -16,35 +16,67 @@ import (
 	"github.com/psviderski/uncloud/internal/cli"
 	"github.com/psviderski/uncloud/pkg/api"
 	"github.com/psviderski/uncloud/pkg/client"
+	"github.com/psviderski/uncloud/pkg/client/compose"
 	"github.com/spf13/cobra"
 )
 
 type logsOptions struct {
-	follow bool
-	tail   string
-	since  string
-	until  string
+	files    []string
+	follow   bool
+	tail     string
+	since    string
+	until    string
+	utc      bool
+	machines []string
 }
 
-func NewLogsCommand() *cobra.Command {
+func NewLogsCommand(groupID string) *cobra.Command {
 	var options logsOptions
 
 	cmd := &cobra.Command{
-		Use:     "logs SERVICE [SERVICE...]",
+		Use:     "logs [SERVICE...]",
 		Aliases: []string{"log"},
 		Short:   "View service logs.",
-		Long:    "View logs from all replicas of the specified service(s) across all machines in the cluster.",
-		Args:    cobra.MinimumNArgs(1),
+		Long: `View logs from all replicas of the specified service(s) across all machines in the cluster.
+
+If no services are specified, streams logs from all services defined in the Compose file
+(compose.yaml by default or the file(s) specified with --file).`,
+		Example: `  # View recent logs for a service.
+  uc logs web
+
+  # Stream logs in real-time (follow mode).
+  uc logs -f web
+
+  # View logs from multiple services.
+  uc logs web api db
+
+  # View logs from all services in compose.yaml.
+  uc logs
+
+  # Show last 20 lines per replica (default is 100).
+  uc logs -n 20 web
+
+  # Show all logs without line limit.
+  uc logs -n all web
+
+  # View logs from a specific time range.
+  uc logs --since 3h --until 1h30m web
+
+  # View logs only from replicas running on specific machines.
+  uc logs -m machine1,machine2 web api`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			uncli := cmd.Context().Value("cli").(*cli.CLI)
-			return streamLogs(cmd.Context(), uncli, args, options)
+			return runLogs(cmd.Context(), uncli, args, options)
 		},
+		GroupID: groupID,
 	}
 
+	cmd.Flags().StringSliceVar(&options.files, "file", nil,
+		"One or more Compose files to load service names from when no services are specified. (default compose.yaml)")
 	cmd.Flags().BoolVarP(&options.follow, "follow", "f", false,
 		"Continually stream new logs.")
-	cmd.Flags().StringVarP(&options.tail, "tail", "n", "100",
-		"Show the most recent logs and limit the number of lines shown per replica. Use 'all' to show all logs.")
+	cmd.Flags().StringSliceVarP(&options.machines, "machine", "m", nil,
+		"Filter logs by machine name or ID. Can be specified multiple times or as a comma-separated list.")
 	cmd.Flags().StringVar(&options.since, "since", "",
 		"Show logs generated on or after the given timestamp. Accepts relative duration, RFC 3339 date, or Unix timestamp.\n"+
 			"Examples:\n"+
@@ -54,14 +86,31 @@ func NewLogsCommand() *cobra.Command {
 			"  --since 2024-05-14T22:50:00        RFC 3339 date/time using local timezone\n"+
 			"  --since 2024-01-31T10:30:00Z       RFC 3339 date/time in UTC\n"+
 			"  --since 1763953966                 Unix timestamp (seconds since January 1, 1970)")
+	cmd.Flags().StringVarP(&options.tail, "tail", "n", "100",
+		"Show the most recent logs and limit the number of lines shown per replica. Use 'all' to show all logs.")
 	cmd.Flags().StringVar(&options.until, "until", "",
 		"Show logs generated before the given timestamp. Accepts relative duration, RFC 3339 date, or Unix timestamp.\n"+
 			"See --since for examples.")
+	cmd.Flags().BoolVar(&options.utc, "utc", false,
+		"Print timestamps in UTC instead of local timezone.")
 
 	return cmd
 }
 
-func streamLogs(ctx context.Context, uncli *cli.CLI, serviceNames []string, opts logsOptions) error {
+func runLogs(ctx context.Context, uncli *cli.CLI, serviceNames []string, opts logsOptions) error {
+	// If no services specified, try to load them from the Compose file(s).
+	if len(serviceNames) == 0 {
+		project, err := compose.LoadProject(ctx, opts.files)
+		if err != nil {
+			return fmt.Errorf("load compose file(s): %w", err)
+		}
+		// View logs for all services, including disabled by inactive profiles.
+		serviceNames = append(project.ServiceNames(), project.DisabledServiceNames()...)
+		if len(serviceNames) == 0 {
+			return errors.New("no services found in compose file(s)")
+		}
+	}
+
 	// Parse tail option.
 	tail := -1
 	if opts.tail != "all" {
@@ -79,17 +128,17 @@ func streamLogs(ctx context.Context, uncli *cli.CLI, serviceNames []string, opts
 	defer c.Close()
 
 	logsOpts := api.ServiceLogsOptions{
-		Follow: opts.follow,
-		Tail:   tail,
-		Since:  opts.since,
-		Until:  opts.until,
+		Follow:   opts.follow,
+		Tail:     tail,
+		Since:    opts.since,
+		Until:    opts.until,
+		Machines: cli.ExpandCommaSeparatedValues(opts.machines),
 	}
 
 	// Collect log streams from all services.
 	machineIDsSet := mapset.NewSet[string]()
 	svcStreams := make([]<-chan api.ServiceLogEntry, 0, len(serviceNames))
 	for _, serviceName := range serviceNames {
-		// TODO: set Heartbeats in the opts.
 		svc, ch, err := c.ServiceLogs(ctx, serviceName, logsOpts)
 		if err != nil {
 			return fmt.Errorf("stream logs for service '%s': %w", serviceName, err)
@@ -119,7 +168,7 @@ func streamLogs(ctx context.Context, uncli *cli.CLI, serviceNames []string, opts
 		machineNames = append(machineNames, m.Machine.Name)
 	}
 
-	formatter := newLogFormatter(machineNames, serviceNames)
+	formatter := newLogFormatter(machineNames, serviceNames, opts.utc)
 
 	// Print merged logs.
 	for entry := range stream {
@@ -154,9 +203,11 @@ type logFormatter struct {
 
 	maxMachineWidth int
 	maxServiceWidth int
+
+	utc bool
 }
 
-func newLogFormatter(machineNames, serviceNames []string) *logFormatter {
+func newLogFormatter(machineNames, serviceNames []string, utc bool) *logFormatter {
 	slices.Sort(machineNames)
 	slices.Sort(serviceNames)
 
@@ -179,13 +230,19 @@ func newLogFormatter(machineNames, serviceNames []string) *logFormatter {
 		serviceNames:    serviceNames,
 		maxMachineWidth: maxMachineWidth,
 		maxServiceWidth: maxServiceWidth,
+		utc:             utc,
 	}
 }
 
-// formatTimestamp formats timestamp using local timezone.
+// formatTimestamp formats timestamp using local timezone or UTC if configured.
 func (f *logFormatter) formatTimestamp(t time.Time) string {
+	if f.utc {
+		t = t.UTC()
+	} else {
+		t = t.In(time.Local)
+	}
 	dimStyle := lipgloss.NewStyle().Faint(true)
-	t = t.In(time.Local)
+
 	return dimStyle.Render(t.Format(time.StampMilli))
 }
 

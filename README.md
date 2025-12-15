@@ -40,7 +40,7 @@ complexity of Kubernetes.
 * **No control plane**: Fully decentralised design eliminates single points of failure and reduces operational overhead.
 * **Imperative over declarative**: Favoring imperative operations over state reconciliation simplifies both the mental
   model and troubleshooting.
-* **Managed DNS**: Automatic DNS records `*.<id>.cluster.uncloud.run` for services with public access via managed
+* **Managed DNS**: Automatic DNS records `*.xxxxxx.uncld.dev` for services with public access via managed
   [Uncloud DNS](https://github.com/psviderski/uncloud-dns) service.
 * **Automatic HTTPS**: Built-in Caddy reverse proxy handles TLS certificate provisioning and renewal using Let's
   Encrypt.
@@ -336,6 +336,10 @@ These companies and projects are helping Uncloud with their generous sponsorship
 </a>
 
 ## ❤️ Contributors
+
+<a href="https://trendshift.io/repositories/14069">
+    <img alt="Trendshift" src="https://trendshift.io/api/badge/repositories/14069" />
+</a>
 
 Thank you [@cedws](https://github.com/cedws) for being the first contributor to Uncloud! 🎉
 
