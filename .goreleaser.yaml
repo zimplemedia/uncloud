@@ -80,17 +80,18 @@ changelog:
       - "^docs:"
       - "^test:"
 
-brews:
-  - name: uncloud
-    description: "Uncloud CLI"
-    homepage: "https://uncloud.run"
-    ids:
-      - uncloud
-    install: |
-      bin.install "uncloud"
-      bin.install_symlink "uncloud" => "uc"
-    skip_upload: false
-    repository:
-      owner: psviderski
-      name: homebrew-tap
-      token: "{{ .Env.GITHUB_TOKEN_HOMEBREW_TAP }}"
+# Homebrew tap disabled for fork
+# brews:
+#   - name: uncloud
+#     description: "Uncloud CLI"
+#     homepage: "https://uncloud.run"
+#     ids:
+#       - uncloud
+#     install: |
+#       bin.install "uncloud"
+#       bin.install_symlink "uncloud" => "uc"
+#     skip_upload: false
+#     repository:
+#       owner: psviderski
+#       name: homebrew-tap
+#       token: "{{ .Env.GITHUB_TOKEN_HOMEBREW_TAP }}"
