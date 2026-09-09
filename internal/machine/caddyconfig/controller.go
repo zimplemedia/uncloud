@@ -44,6 +44,7 @@ type Controller struct {
 type containerFingerprint struct {
 	ID          string
 	IP          netip.Addr
+	Healthy     bool
 	Ports       []api.PortSpec
 	CaddyConfig string
 }
@@ -52,6 +53,7 @@ type containerFingerprint struct {
 func (f containerFingerprint) Equal(other containerFingerprint) bool {
 	return f.ID == other.ID &&
 		f.IP == other.IP &&
+		f.Healthy == other.Healthy &&
 		api.PortsEqual(f.Ports, other.Ports) &&
 		f.CaddyConfig == other.CaddyConfig
 }
@@ -95,11 +97,11 @@ func (c *Controller) Run(ctx context.Context) error {
 	}
 	c.log.Info("Subscribed to container changes in the cluster to generate Caddy configuration.")
 
-	containers = filterHealthyContainers(containers)
+	containers = filterHookContainers(containers)
 	c.generateAndLoadCaddyfile(ctx, containers)
 
 	// TODO: left for backward compatibility, remove later.
-	if err = c.generateJSONConfig(containers); err != nil {
+	if err = c.generateJSONConfig(filterHealthyContainers(containers)); err != nil {
 		c.log.Error("Failed to generate Caddy JSON configuration to disk.", "err", err)
 	}
 
@@ -116,11 +118,11 @@ func (c *Controller) Run(ctx context.Context) error {
 				c.log.Error("Failed to list containers.", "err", err)
 				continue
 			}
-			containers = filterHealthyContainers(containers)
+			containers = filterHookContainers(containers)
 			c.generateAndLoadCaddyfile(ctx, containers)
 
 			// TODO: left for backward compatibility, remove later.
-			if err = c.generateJSONConfig(containers); err != nil {
+			if err = c.generateJSONConfig(filterHealthyContainers(containers)); err != nil {
 				c.log.Error("Failed to generate Caddy JSON configuration to disk.", "err", err)
 			}
 		case <-ctx.Done():
@@ -129,16 +131,25 @@ func (c *Controller) Run(ctx context.Context) error {
 	}
 }
 
-// filterHealthyContainers filters out unhealthy and hook containers.
+// filterHookContainers filters out hook containers which must never affect the generated Caddy configuration.
+func filterHookContainers(containers []store.ContainerRecord) []store.ContainerRecord {
+	filtered := make([]store.ContainerRecord, 0, len(containers))
+	for _, cr := range containers {
+		if cr.Container.IsHook() {
+			continue
+		}
+		filtered = append(filtered, cr)
+	}
+	return filtered
+}
+
+// filterHealthyContainers filters out unhealthy containers.
 // TODO: Filters out containers from this machine that are likely unavailable. The availability can be determined
 // by the cluster membership state of the machine that the container is running on. Implement machine membership
 // check using Corrossion Admin client.
 func filterHealthyContainers(containers []store.ContainerRecord) []store.ContainerRecord {
 	healthy := make([]store.ContainerRecord, 0, len(containers))
 	for _, cr := range containers {
-		if cr.Container.IsHook() {
-			continue
-		}
 		if cr.Container.Healthy() {
 			healthy = append(healthy, cr)
 		}
@@ -149,31 +160,61 @@ func filterHealthyContainers(containers []store.ContainerRecord) []store.Contain
 // generateAndLoadCaddyfile regenerates the Caddyfile from the given containers and loads it into the local Caddy
 // if available.
 func (c *Controller) generateAndLoadCaddyfile(ctx context.Context, containers []store.ContainerRecord) {
-	// Check if Caddy is available before attempting to generate and load config.
-	caddyAvailable := c.client.IsAvailable()
+	if !c.client.IsAvailable() {
+		// Caddy is not running on this machine (or not accessible via the admin socket). When it starts, it boots
+		// from the Caddyfile on disk, so the config loaded via the admin API last time no longer determines what
+		// Caddy will run. Invalidate the fingerprint cache to force a full regeneration and load on the next
+		// container change once Caddy is back.
+		c.lastFingerprint = nil
 
-	// Skip regeneration when Caddy is available and the containers since the last successful load haven't changed.
-	// When Caddy is unavailable we still regenerate to keep the Caddyfile on disk updated.
+		if c.caddyDeployedLocally(containers) {
+			if _, err := os.Stat(c.caddyfilePath); err == nil {
+				// The caddy service is deployed on this machine, so Caddy is likely restarting or starting up and
+				// will boot from the existing Caddyfile. A Caddyfile generated now would not include user-defined
+				// configs (they can't be validated without a running Caddy). Overwriting the existing Caddyfile
+				// with it would make the restarting Caddy boot without user-defined configs, e.g. a global options
+				// block from the caddy service spec that configures certificate storage. The existing Caddyfile was
+				// successfully loaded into Caddy before (hence valid), so keep it for Caddy to boot from.
+				c.log.Debug("Caddy is not running on this machine, keeping the existing Caddyfile for it to boot from.",
+					"path", c.caddyfilePath)
+				return
+			}
+		}
+
+		// Caddy is not deployed on this machine (or no Caddyfile exists yet). Write a config without user-defined
+		// configs so that when Caddy is deployed on this machine, it can pick it up.
+		caddyfile, err := c.generator.Generate(ctx, containers, false)
+		if err != nil {
+			c.log.Error("Failed to generate Caddyfile configuration.", "err", err)
+			return
+		}
+		if err = c.writeCaddyfileIfChanged(caddyfile); err != nil {
+			c.log.Error("Failed to write Caddyfile to disk.", "err", err)
+			return
+		}
+		c.log.Debug("Caddy is not running on this machine, wrote a Caddyfile without user-defined configs.",
+			"path", c.caddyfilePath)
+		return
+	}
+
+	// Skip regeneration when the containers haven't changed since the last successful load.
 	fingerprint := fingerprintContainers(containers)
-	if caddyAvailable && slices.EqualFunc(fingerprint, c.lastFingerprint, containerFingerprint.Equal) {
+	if slices.EqualFunc(fingerprint, c.lastFingerprint, containerFingerprint.Equal) {
 		c.log.Debug("Caddy configuration is unchanged.", "path", c.caddyfilePath)
 		return
 	}
 
-	caddyfile, err := c.generator.Generate(ctx, containers, caddyAvailable)
+	caddyfile, err := c.generator.Generate(ctx, containers, true)
 	if err != nil {
 		c.log.Error("Failed to generate Caddyfile configuration.", "err", err)
 		return
 	}
 
-	if !caddyAvailable {
-		// Caddy is not running so the generated Caddyfile should not include user-defined configs thus must be valid.
-		// It's safe to write the config to disk so that when Caddy is deployed on this machine, it can pick it up.
-		if err = c.writeCaddyfileIfChanged(caddyfile); err != nil {
-			c.log.Error("Failed to write Caddyfile to disk.", "err", err)
-			return
-		}
-		c.log.Debug("Caddy is not running on this machine, skipping configuration load.", "path", c.caddyfilePath)
+	// Skip the load if the generated config matches the last written Caddyfile. Caddy already runs it: it was
+	// either loaded via the admin API or Caddy booted from it on disk after a restart.
+	if caddyfileBody(caddyfile) == caddyfileBody(c.lastCaddyfile) {
+		c.lastFingerprint = fingerprint
+		c.log.Debug("Generated Caddy configuration matches the running one, skipping load.", "path", c.caddyfilePath)
 		return
 	}
 
@@ -200,6 +241,14 @@ func (c *Controller) generateAndLoadCaddyfile(ctx context.Context, containers []
 	c.log.Info("New Caddy configuration loaded into local Caddy instance.", "path", c.caddyfilePath)
 }
 
+// caddyDeployedLocally returns whether a container of the caddy service exists on this machine, regardless of its
+// state: a restarting or just created caddy container still means Caddy is deployed here.
+func (c *Controller) caddyDeployedLocally(containers []store.ContainerRecord) bool {
+	return slices.ContainsFunc(containers, func(cr store.ContainerRecord) bool {
+		return cr.MachineID == c.machineID && cr.Container.ServiceName() == CaddyServiceName
+	})
+}
+
 // fingerprintContainers returns a fingerprint of containers that the Caddyfile generator depends on.
 func fingerprintContainers(containers []store.ContainerRecord) []containerFingerprint {
 	fingerprints := make([]containerFingerprint, len(containers))
@@ -209,6 +258,7 @@ func fingerprintContainers(containers []store.ContainerRecord) []containerFinger
 		fingerprints[i] = containerFingerprint{
 			ID:          cr.Container.ID,
 			IP:          cr.Container.UncloudNetworkIP(),
+			Healthy:     cr.Container.Healthy(),
 			Ports:       ports,
 			CaddyConfig: cr.Container.ServiceSpec.CaddyConfig(),
 		}

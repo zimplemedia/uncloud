@@ -93,12 +93,15 @@ func NewCaddyfileGenerator(
 	}
 }
 
-// Generate creates a Caddyfile configuration based on the provided service containers.
-// The Caddyfile is generated from the service ports of the healthy containers.
-// If a 'caddy' service container is running on this machine and defines a custom Caddy config (x-caddy) in its service
-// spec, it will be validated and prepended to the generated Caddyfile. Custom Caddy configs (x-caddy) defined in other
-// service specs are validated and appended to the generated Caddyfile. Invalid configs are logged and skipped to ensure
-// the generated Caddyfile remains valid.
+// Generate creates a Caddyfile configuration based on the provided service containers. The records may include
+// unhealthy containers which are only used to look up service specs; the Caddyfile itself is generated from the
+// service ports of the healthy containers.
+// If a 'caddy' service container exists on this machine and defines a custom Caddy config (x-caddy) in its service
+// spec, it will be validated and prepended to the generated Caddyfile. The caddy container doesn't have to be
+// healthy: the custom global config is part of the deployed caddy service spec, so it must survive config
+// regenerations triggered while the caddy container is restarting or starting up (temporarily unhealthy).
+// Custom Caddy configs (x-caddy) defined in other service specs are validated and appended to the generated
+// Caddyfile. Invalid configs are logged and skipped to ensure the generated Caddyfile remains valid.
 //
 // The final Caddyfile structure includes:
 //
@@ -125,8 +128,9 @@ func (g *CaddyfileGenerator) Generate(
 		)
 	})
 
-	containers := make([]api.ServiceContainer, len(records))
-	for i, cr := range records {
+	healthyRecords := filterHealthyContainers(records)
+	containers := make([]api.ServiceContainer, len(healthyRecords))
+	for i, cr := range healthyRecords {
 		containers[i] = cr.Container
 	}
 
@@ -144,7 +148,10 @@ func (g *CaddyfileGenerator) Generate(
 	// Track validation errors for reporting.
 	var configErrors []string
 
-	// Find the 'caddy' service container on this machine. Use the most recent one if multiple exist.
+	// Find the 'caddy' service container on this machine to get the user-defined global config from its spec.
+	// Use the most recent one if multiple exist. Note that all records are searched, not only healthy ones:
+	// the global config must not be dropped from the generated Caddyfile while the caddy container is
+	// restarting or hasn't passed its health check yet.
 	var caddyCtr *api.ServiceContainer
 	for _, cr := range records {
 		if cr.MachineID == g.machineID && cr.Container.ServiceName() == CaddyServiceName &&
@@ -153,7 +160,7 @@ func (g *CaddyfileGenerator) Generate(
 		}
 	}
 
-	// If the caddy container is running on this machine and has a custom Caddy config (global),
+	// If the caddy container exists on this machine and has a custom Caddy config (global),
 	// prepend it to the generated Caddyfile and validate it.
 	if caddyCtr != nil && caddyCtr.ServiceSpec.CaddyConfig() != "" {
 		// Render the custom global Caddy config as a Go template with the upstreams.

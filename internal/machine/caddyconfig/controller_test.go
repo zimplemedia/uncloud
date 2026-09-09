@@ -1,12 +1,24 @@
 package caddyconfig
 
 import (
+	"context"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"reflect"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/docker/docker/api/types/container"
+	"github.com/psviderski/uncloud/internal/machine/store"
 	"github.com/psviderski/uncloud/pkg/api"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestContainerFingerprint_EqualCoversAllFields is a guard: when a field is added to containerFingerprint,
@@ -16,8 +28,9 @@ func TestContainerFingerprint_EqualCoversAllFields(t *testing.T) {
 	t.Parallel()
 
 	base := containerFingerprint{
-		ID: "container-1",
-		IP: netip.MustParseAddr("10.210.0.2"),
+		ID:      "container-1",
+		IP:      netip.MustParseAddr("10.210.0.2"),
+		Healthy: true,
 		Ports: []api.PortSpec{{
 			Hostname:      "app.example.com",
 			ContainerPort: 8080,
@@ -43,6 +56,8 @@ func TestContainerFingerprint_EqualCoversAllFields(t *testing.T) {
 				v.SetString(v.String() + "-changed")
 			case "IP":
 				v.Set(reflect.ValueOf(netip.MustParseAddr("10.210.0.99")))
+			case "Healthy":
+				v.SetBool(!v.Bool())
 			case "Ports":
 				mutated.Ports = []api.PortSpec{{
 					Hostname:      "different.example.com",
@@ -60,4 +75,254 @@ func TestContainerFingerprint_EqualCoversAllFields(t *testing.T) {
 				field.Name)
 		})
 	}
+}
+
+// fakeCaddyAdmin is a fake Caddy admin API served over a Unix socket. It accepts any Caddyfile on /adapt and
+// records the Caddyfiles that get loaded via /load.
+type fakeCaddyAdmin struct {
+	socketPath string
+	server     *http.Server
+
+	mu sync.Mutex
+	// lastAdapted is the Caddyfile received by the most recent /adapt request.
+	lastAdapted string
+	// loaded contains the Caddyfile for every successful /load request (captured from the preceding /adapt
+	// request since CaddyAdminClient.Load posts the adapted JSON config to /load).
+	loaded []string
+}
+
+// newTestSocketPath returns a socket path in a dedicated short temp directory. Unix socket paths are limited to
+// ~104 characters on macOS and t.TempDir() paths embedding the test name can exceed that.
+func newTestSocketPath(t *testing.T) string {
+	t.Helper()
+
+	dir, err := os.MkdirTemp("", "uc-caddy-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+
+	return filepath.Join(dir, "admin.sock")
+}
+
+func startFakeCaddyAdmin(t *testing.T, socketPath string) *fakeCaddyAdmin {
+	t.Helper()
+
+	f := &fakeCaddyAdmin{socketPath: socketPath}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /adapt", func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+
+		f.mu.Lock()
+		f.lastAdapted = string(body)
+		f.mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"result": {}}`))
+	})
+	mux.HandleFunc("POST /load", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.loaded = append(f.loaded, f.lastAdapted)
+		f.mu.Unlock()
+
+		w.WriteHeader(http.StatusOK)
+	})
+	f.server = &http.Server{Handler: mux}
+
+	listener, err := net.Listen("unix", socketPath)
+	require.NoError(t, err)
+	go f.server.Serve(listener) //nolint:errcheck // Serve always returns a non-nil error on Close.
+	t.Cleanup(f.stop)
+
+	return f
+}
+
+// stop shuts down the fake admin API and removes the socket file to simulate Caddy not running.
+func (f *fakeCaddyAdmin) stop() {
+	_ = f.server.Close()
+	_ = os.Remove(f.socketPath)
+}
+
+func (f *fakeCaddyAdmin) loadedCaddyfiles() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.loaded...)
+}
+
+// newTestController creates a Controller wired to the fake Caddy admin socket with the Caddyfile stored in dir.
+func newTestController(dir, socketPath string) *Controller {
+	client := NewCaddyAdminClient(socketPath)
+	c := &Controller{
+		machineID:     "test-machine-id",
+		caddyfilePath: filepath.Join(dir, "Caddyfile"),
+		client:        client,
+	}
+	c.log = slog.Default()
+	c.generator = NewCaddyfileGenerator(c.machineID, "test-machine", client, c.log)
+	return c
+}
+
+// TestControllerCaddyRestartPreservesCustomConfig reproduces github.com/psviderski/uncloud/issues/412: a config
+// regeneration triggered while the caddy container is restarting must not lose the user-defined global config
+// deployed with the caddy service (uc caddy deploy --caddyfile), neither in the Caddyfile on disk that Caddy boots
+// from nor in the config loaded via the admin API after Caddy is back.
+func TestControllerCaddyRestartPreservesCustomConfig(t *testing.T) {
+	t.Parallel()
+
+	const globalConfig = `{
+	storage redis {
+		host my-redis
+	}
+}`
+	dir := t.TempDir()
+	socketPath := newTestSocketPath(t)
+	admin := startFakeCaddyAdmin(t, socketPath)
+	c := newTestController(dir, socketPath)
+	ctx := context.Background()
+
+	caddyRecord := newContainerRecordWithCaddyConfig("caddy", "10.210.0.1", globalConfig, "test-machine-id", time.Now())
+	appRecord := newContainerRecordWithPorts("app", "10.210.0.2", []string{"app.example.com:8080/http"}, "test-machine-id")
+
+	// 1. Initial generation with a healthy caddy container: the global config is loaded and written to disk.
+	c.generateAndLoadCaddyfile(ctx, []store.ContainerRecord{caddyRecord, appRecord})
+
+	caddyfile, err := os.ReadFile(c.caddyfilePath)
+	require.NoError(t, err)
+	assert.Contains(t, string(caddyfile), "storage redis", "initial Caddyfile must contain the global config")
+	require.Len(t, admin.loadedCaddyfiles(), 1)
+	assert.Contains(t, admin.loadedCaddyfiles()[0], "storage redis", "loaded config must contain the global config")
+	assert.NotNil(t, c.lastFingerprint)
+
+	// 2. Caddy container is restarting: the container is not running and the admin socket is not accepting
+	// connections. The Caddyfile on disk must be preserved as Caddy boots from it, and the fingerprint cache
+	// must be invalidated as the previously loaded config no longer determines what Caddy will run.
+	admin.stop()
+	stoppedCaddyRecord := caddyRecord
+	stoppedState := *caddyRecord.Container.State
+	stoppedState.Running = false
+	stoppedCaddyRecord.Container.State = &stoppedState
+
+	c.generateAndLoadCaddyfile(ctx, []store.ContainerRecord{stoppedCaddyRecord, appRecord})
+
+	caddyfile, err = os.ReadFile(c.caddyfilePath)
+	require.NoError(t, err)
+	assert.Contains(t, string(caddyfile), "storage redis",
+		"Caddyfile must not lose the global config while Caddy is restarting as Caddy boots from it")
+	assert.Nil(t, c.lastFingerprint, "fingerprint cache must be invalidated when Caddy is unavailable")
+
+	// 3. Caddy is back with the same container set: the regeneration must not be skipped as unchanged, and the
+	// loaded config must contain the global config again.
+	admin = startFakeCaddyAdmin(t, socketPath)
+
+	c.generateAndLoadCaddyfile(ctx, []store.ContainerRecord{caddyRecord, appRecord})
+
+	caddyfile, err = os.ReadFile(c.caddyfilePath)
+	require.NoError(t, err)
+	assert.Contains(t, string(caddyfile), "storage redis")
+	assert.NotNil(t, c.lastFingerprint, "regeneration must not be skipped after Caddy restart")
+	// Caddy booted from the preserved Caddyfile which matches the regenerated config, so a load is not required.
+	// But if one happened, it must contain the global config.
+	for _, loaded := range admin.loadedCaddyfiles() {
+		assert.Contains(t, loaded, "storage redis")
+	}
+}
+
+// TestControllerCaddyRestartLoadsCustomConfigWhileUnhealthy verifies that a regeneration triggered while the caddy
+// container hasn't become healthy yet (e.g. it's starting up and the admin socket is already accepting connections)
+// doesn't load a config without the user-defined global config into the running Caddy.
+func TestControllerCaddyRestartLoadsCustomConfigWhileUnhealthy(t *testing.T) {
+	t.Parallel()
+
+	const globalConfig = `{
+	storage redis {
+		host my-redis
+	}
+}`
+	dir := t.TempDir()
+	socketPath := newTestSocketPath(t)
+	admin := startFakeCaddyAdmin(t, socketPath)
+	c := newTestController(dir, socketPath)
+	ctx := context.Background()
+
+	caddyRecord := newContainerRecordWithCaddyConfig("caddy", "10.210.0.1", globalConfig, "test-machine-id", time.Now())
+	appRecord := newContainerRecordWithPorts("app", "10.210.0.2", []string{"web.example.com:8080/http"}, "test-machine-id")
+	stoppedAppRecord := newContainerRecordWithPorts(
+		"stopped-app", "10.210.0.3", []string{"stopped.example.com:8080/http"}, "test-machine-id")
+	stoppedAppRecord.Container.State = &container.State{Running: false}
+
+	// The caddy container is restarting but the admin socket is already available.
+	restartingCaddyRecord := caddyRecord
+	restartingState := *caddyRecord.Container.State
+	restartingState.Restarting = true
+	restartingCaddyRecord.Container.State = &restartingState
+
+	c.generateAndLoadCaddyfile(ctx, []store.ContainerRecord{restartingCaddyRecord, appRecord, stoppedAppRecord})
+
+	loaded := admin.loadedCaddyfiles()
+	require.Len(t, loaded, 1)
+	assert.Contains(t, loaded[0], "storage redis",
+		"config loaded while the caddy container is unhealthy must still contain the global config from its spec")
+	assert.Contains(t, loaded[0], "web.example.com")
+	assert.NotContains(t, loaded[0], "stopped.example.com",
+		"ports of unhealthy containers must not generate sites")
+}
+
+// TestControllerCaddyNotDeployedOverwritesCaddyfile verifies that the Caddyfile is regenerated without
+// user-defined configs when the caddy service is removed from the machine: the existing Caddyfile is only
+// preserved for a caddy container that is restarting, not when Caddy is gone for good.
+func TestControllerCaddyNotDeployedOverwritesCaddyfile(t *testing.T) {
+	t.Parallel()
+
+	const globalConfig = `{
+	storage redis {
+		host my-redis
+	}
+}`
+	dir := t.TempDir()
+	socketPath := newTestSocketPath(t)
+	admin := startFakeCaddyAdmin(t, socketPath)
+	c := newTestController(dir, socketPath)
+	ctx := context.Background()
+
+	caddyRecord := newContainerRecordWithCaddyConfig("caddy", "10.210.0.1", globalConfig, "test-machine-id", time.Now())
+	appRecord := newContainerRecordWithPorts("app", "10.210.0.2", []string{"removed.example.com:8080/http"}, "test-machine-id")
+
+	c.generateAndLoadCaddyfile(ctx, []store.ContainerRecord{caddyRecord, appRecord})
+
+	caddyfile, err := os.ReadFile(c.caddyfilePath)
+	require.NoError(t, err)
+	require.Contains(t, string(caddyfile), "storage redis")
+
+	// The caddy service is removed from the machine: no caddy container records and the admin socket is gone.
+	admin.stop()
+	c.generateAndLoadCaddyfile(ctx, []store.ContainerRecord{appRecord})
+
+	caddyfile, err = os.ReadFile(c.caddyfilePath)
+	require.NoError(t, err)
+	assert.NotContains(t, string(caddyfile), "storage redis",
+		"Caddyfile must be regenerated without user-defined configs when the caddy service is removed")
+	assert.Contains(t, string(caddyfile), "# NOTE: User-defined configs for services were skipped")
+	assert.Nil(t, c.lastFingerprint)
+}
+
+// TestControllerCaddyUnavailableBootstrap verifies that a bootstrap Caddyfile without user-defined configs is
+// written when Caddy is not running and no Caddyfile exists on the machine yet.
+func TestControllerCaddyUnavailableBootstrap(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	// No fake admin server is started: Caddy is not running on this machine.
+	c := newTestController(dir, newTestSocketPath(t))
+	ctx := context.Background()
+
+	caddyRecord := newContainerRecordWithCaddyConfig("caddy", "10.210.0.1", "{\n\tglobal directive\n}", "test-machine-id", time.Now())
+	appRecord := newContainerRecordWithPorts("app", "10.210.0.2", []string{"bootstrap.example.com:8080/http"}, "test-machine-id")
+
+	c.generateAndLoadCaddyfile(ctx, []store.ContainerRecord{caddyRecord, appRecord})
+
+	caddyfile, err := os.ReadFile(c.caddyfilePath)
+	require.NoError(t, err)
+	assert.Contains(t, string(caddyfile), "bootstrap.example.com", "bootstrap Caddyfile must contain generated sites")
+	assert.NotContains(t, string(caddyfile), "global directive",
+		"bootstrap Caddyfile must not contain user-defined configs as they can't be validated")
+	assert.Nil(t, c.lastFingerprint)
 }
