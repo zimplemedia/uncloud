@@ -476,6 +476,7 @@ func (m *Machine) Run(ctx context.Context) error {
 				m.config.CaddyConfigDir,
 				DefaultCaddyAdminSockPath,
 				m.store,
+				m.dockerService,
 			)
 			if err != nil {
 				return fmt.Errorf("create caddyconfig controller: %w", err)

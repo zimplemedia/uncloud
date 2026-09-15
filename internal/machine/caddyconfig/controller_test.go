@@ -2,6 +2,7 @@ package caddyconfig
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/psviderski/uncloud/internal/machine/docker"
 	"github.com/psviderski/uncloud/internal/machine/store"
 	"github.com/psviderski/uncloud/pkg/api"
 	"github.com/stretchr/testify/assert"
@@ -148,13 +150,35 @@ func (f *fakeCaddyAdmin) loadedCaddyfiles() []string {
 	return append([]string(nil), f.loaded...)
 }
 
+// fakeLocalContainerLister is a fake Docker daemon view of the caddy service on this machine.
+type fakeLocalContainerLister struct {
+	// caddyDeployed reports a caddy service container (in any state) on this machine.
+	caddyDeployed bool
+	err           error
+}
+
+func (f *fakeLocalContainerLister) ListServiceContainers(
+	_ context.Context, serviceNameOrID string, _ container.ListOptions,
+) (docker.ListServiceContainersResult, error) {
+	if f.err != nil {
+		return docker.ListServiceContainersResult{}, f.err
+	}
+	var result docker.ListServiceContainersResult
+	if f.caddyDeployed && serviceNameOrID == CaddyServiceName {
+		result.Containers = []api.ServiceContainer{{}}
+	}
+	return result, nil
+}
+
 // newTestController creates a Controller wired to the fake Caddy admin socket with the Caddyfile stored in dir.
+// The fake Docker daemon reports a caddy service container on this machine.
 func newTestController(dir, socketPath string) *Controller {
 	client := NewCaddyAdminClient(socketPath)
 	c := &Controller{
 		machineID:     "test-machine-id",
 		caddyfilePath: filepath.Join(dir, "Caddyfile"),
 		client:        client,
+		docker:        &fakeLocalContainerLister{caddyDeployed: true},
 	}
 	c.log = slog.Default()
 	c.generator = NewCaddyfileGenerator(c.machineID, "test-machine", client, c.log)
@@ -292,8 +316,10 @@ func TestControllerCaddyNotDeployedOverwritesCaddyfile(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, string(caddyfile), "storage redis")
 
-	// The caddy service is removed from the machine: no caddy container records and the admin socket is gone.
+	// The caddy service is removed from the machine: no caddy container in Docker, no caddy container records
+	// and the admin socket is gone.
 	admin.stop()
+	c.docker = &fakeLocalContainerLister{caddyDeployed: false}
 	c.generateAndLoadCaddyfile(ctx, []store.ContainerRecord{appRecord})
 
 	caddyfile, err = os.ReadFile(c.caddyfilePath)
@@ -302,6 +328,52 @@ func TestControllerCaddyNotDeployedOverwritesCaddyfile(t *testing.T) {
 		"Caddyfile must be regenerated without user-defined configs when the caddy service is removed")
 	assert.Contains(t, string(caddyfile), "# NOTE: User-defined configs for services were skipped")
 	assert.Nil(t, c.lastFingerprint)
+}
+
+// TestControllerCaddyUnavailableTrustsDockerNotStore verifies that the decision to keep the existing Caddyfile
+// while Caddy is down is based on the Docker daemon, not on the cluster store: while the daemon is starting up, the
+// store may return a partial view of the machine's containers that lacks the local caddy container record.
+func TestControllerCaddyUnavailableTrustsDockerNotStore(t *testing.T) {
+	t.Parallel()
+
+	const globalConfig = `{
+	storage redis {
+		host my-redis
+	}
+}`
+	dir := t.TempDir()
+	socketPath := newTestSocketPath(t)
+	admin := startFakeCaddyAdmin(t, socketPath)
+	c := newTestController(dir, socketPath)
+	ctx := context.Background()
+
+	caddyRecord := newContainerRecordWithCaddyConfig("caddy", "10.210.0.1", globalConfig, "test-machine-id", time.Now())
+	appRecord := newContainerRecordWithPorts("app", "10.210.0.2", []string{"partial.example.com:8080/http"}, "test-machine-id")
+
+	c.generateAndLoadCaddyfile(ctx, []store.ContainerRecord{caddyRecord, appRecord})
+
+	caddyfile, err := os.ReadFile(c.caddyfilePath)
+	require.NoError(t, err)
+	require.Contains(t, string(caddyfile), "storage redis")
+
+	// Caddy is down and the store returns a partial view without the local caddy record, but Docker still
+	// reports the caddy container on this machine.
+	admin.stop()
+	c.generateAndLoadCaddyfile(ctx, []store.ContainerRecord{appRecord})
+
+	caddyfile, err = os.ReadFile(c.caddyfilePath)
+	require.NoError(t, err)
+	assert.Contains(t, string(caddyfile), "storage redis",
+		"Caddyfile must be kept when Docker reports a caddy container even if the store view lacks it")
+
+	// If Docker can't be queried, keeping the existing Caddyfile is the safe default.
+	c.docker = &fakeLocalContainerLister{err: errors.New("docker unavailable")}
+	c.generateAndLoadCaddyfile(ctx, []store.ContainerRecord{appRecord})
+
+	caddyfile, err = os.ReadFile(c.caddyfilePath)
+	require.NoError(t, err)
+	assert.Contains(t, string(caddyfile), "storage redis",
+		"Caddyfile must be kept when Docker can't be queried")
 }
 
 // TestControllerCaddyUnavailableBootstrap verifies that a bootstrap Caddyfile without user-defined configs is
