@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types/container"
-	"github.com/psviderski/uncloud/internal/machine/docker"
 	"github.com/psviderski/uncloud/internal/machine/store"
 	"github.com/psviderski/uncloud/pkg/api"
 	"github.com/stretchr/testify/assert"
@@ -157,17 +156,18 @@ type fakeLocalContainerLister struct {
 	err           error
 }
 
-func (f *fakeLocalContainerLister) ListServiceContainers(
-	_ context.Context, serviceNameOrID string, _ container.ListOptions,
-) (docker.ListServiceContainersResult, error) {
+func (f *fakeLocalContainerLister) ContainerList(
+	_ context.Context, options container.ListOptions,
+) ([]container.Summary, error) {
 	if f.err != nil {
-		return docker.ListServiceContainersResult{}, f.err
+		return nil, f.err
 	}
-	var result docker.ListServiceContainersResult
-	if f.caddyDeployed && serviceNameOrID == CaddyServiceName {
-		result.Containers = []api.ServiceContainer{{}}
+	caddyFilter := options.All &&
+		options.Filters.ExactMatch("label", api.LabelServiceName+"="+CaddyServiceName)
+	if f.caddyDeployed && caddyFilter {
+		return []container.Summary{{ID: "caddy-container"}}, nil
 	}
-	return result, nil
+	return nil, nil
 }
 
 // newTestController creates a Controller wired to the fake Caddy admin socket with the Caddyfile stored in dir.
@@ -374,6 +374,18 @@ func TestControllerCaddyUnavailableTrustsDockerNotStore(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(caddyfile), "storage redis",
 		"Caddyfile must be kept when Docker can't be queried")
+
+	// A regeneration caught by the daemon shutting down (cancelled context) must not overwrite the Caddyfile
+	// even if Docker reports no caddy container.
+	c.docker = &fakeLocalContainerLister{caddyDeployed: false}
+	cancelledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	c.generateAndLoadCaddyfile(cancelledCtx, []store.ContainerRecord{appRecord})
+
+	caddyfile, err = os.ReadFile(c.caddyfilePath)
+	require.NoError(t, err)
+	assert.Contains(t, string(caddyfile), "storage redis",
+		"Caddyfile must be kept when the context is cancelled")
 }
 
 // TestControllerCaddyUnavailableBootstrap verifies that a bootstrap Caddyfile without user-defined configs is
