@@ -11,7 +11,9 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/docker/docker/api/types/container"
 	"github.com/psviderski/uncloud/internal/fs"
+	"github.com/psviderski/uncloud/internal/machine/docker"
 	"github.com/psviderski/uncloud/internal/machine/store"
 	"github.com/psviderski/uncloud/pkg/api"
 )
@@ -22,6 +24,15 @@ const (
 	VerifyPath       = "/.uncloud-verify"
 )
 
+// LocalContainerLister lists service containers on this machine directly from the Docker daemon.
+// It's the source of truth for whether the caddy service is deployed on the machine: the cluster store may return
+// a partial view of the machine's containers while the daemon (and its corrosion service) is starting up.
+type LocalContainerLister interface {
+	ListServiceContainers(
+		ctx context.Context, serviceNameOrID string, opts container.ListOptions,
+	) (docker.ListServiceContainersResult, error)
+}
+
 // Controller monitors container changes in the cluster store and generates a configuration file for Caddy reverse
 // proxy. The generated configuration allows Caddy to route external traffic to service containers across the internal
 // network.
@@ -31,6 +42,7 @@ type Controller struct {
 	generator     *CaddyfileGenerator
 	client        *CaddyAdminClient
 	store         *store.Store
+	docker        LocalContainerLister
 	log           *slog.Logger
 	// lastFingerprint caches the fingerprint of the containers used to generate the latest successfully loaded
 	// Caddyfile. nil means it hasn't been loaded yet or the last load failed.
@@ -58,7 +70,9 @@ func (f containerFingerprint) Equal(other containerFingerprint) bool {
 		f.CaddyConfig == other.CaddyConfig
 }
 
-func NewController(machineID, configDir, adminSock string, store *store.Store) (*Controller, error) {
+func NewController(
+	machineID, configDir, adminSock string, store *store.Store, docker LocalContainerLister,
+) (*Controller, error) {
 	if err := os.MkdirAll(configDir, 0o750); err != nil {
 		return nil, fmt.Errorf("create directory for Caddy configuration '%s': %w", configDir, err)
 	}
@@ -75,6 +89,7 @@ func NewController(machineID, configDir, adminSock string, store *store.Store) (
 		caddyfilePath: filepath.Join(configDir, "Caddyfile"),
 		client:        client,
 		store:         store,
+		docker:        docker,
 		log:           log,
 	}, nil
 }
@@ -167,7 +182,7 @@ func (c *Controller) generateAndLoadCaddyfile(ctx context.Context, containers []
 		// container change once Caddy is back.
 		c.lastFingerprint = nil
 
-		if c.caddyDeployedLocally(containers) {
+		if c.caddyDeployedLocally(ctx) {
 			if _, err := os.Stat(c.caddyfilePath); err == nil {
 				// The caddy service is deployed on this machine, so Caddy is likely restarting or starting up and
 				// will boot from the existing Caddyfile. A Caddyfile generated now would not include user-defined
@@ -242,11 +257,23 @@ func (c *Controller) generateAndLoadCaddyfile(ctx context.Context, containers []
 }
 
 // caddyDeployedLocally returns whether a container of the caddy service exists on this machine, regardless of its
-// state: a restarting or just created caddy container still means Caddy is deployed here.
-func (c *Controller) caddyDeployedLocally(containers []store.ContainerRecord) bool {
-	return slices.ContainsFunc(containers, func(cr store.ContainerRecord) bool {
-		return cr.MachineID == c.machineID && cr.Container.ServiceName() == CaddyServiceName
-	})
+// state: a restarting or just created caddy container still means Caddy is deployed here. The Docker daemon is
+// queried directly rather than the cluster store because the store may return a partial view of the machine's
+// containers while the daemon is starting up. If Docker can't be queried, the caddy service is assumed to be
+// deployed as keeping the existing Caddyfile is the safe choice.
+func (c *Controller) caddyDeployedLocally(ctx context.Context) bool {
+	if c.docker == nil {
+		return true
+	}
+
+	result, err := c.docker.ListServiceContainers(ctx, CaddyServiceName, container.ListOptions{All: true})
+	if err != nil {
+		c.log.Warn("Failed to list caddy service containers from Docker, assuming the caddy service is deployed "+
+			"on this machine.", "err", err)
+		return true
+	}
+
+	return len(result.Containers) > 0
 }
 
 // fingerprintContainers returns a fingerprint of containers that the Caddyfile generator depends on.
