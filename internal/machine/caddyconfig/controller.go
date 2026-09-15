@@ -12,8 +12,8 @@ import (
 	"strings"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/psviderski/uncloud/internal/fs"
-	"github.com/psviderski/uncloud/internal/machine/docker"
 	"github.com/psviderski/uncloud/internal/machine/store"
 	"github.com/psviderski/uncloud/pkg/api"
 )
@@ -24,13 +24,12 @@ const (
 	VerifyPath       = "/.uncloud-verify"
 )
 
-// LocalContainerLister lists service containers on this machine directly from the Docker daemon.
-// It's the source of truth for whether the caddy service is deployed on the machine: the cluster store may return
-// a partial view of the machine's containers while the daemon (and its corrosion service) is starting up.
+// LocalContainerLister lists containers on this machine directly from the Docker daemon (the subset of the Docker
+// client used by the controller). It's the source of truth for whether the caddy service is deployed on the machine:
+// the cluster store may return a partial view of the machine's containers while the daemon (and its corrosion
+// service) is starting up.
 type LocalContainerLister interface {
-	ListServiceContainers(
-		ctx context.Context, serviceNameOrID string, opts container.ListOptions,
-	) (docker.ListServiceContainersResult, error)
+	ContainerList(ctx context.Context, options container.ListOptions) ([]container.Summary, error)
 }
 
 // Controller monitors container changes in the cluster store and generates a configuration file for Caddy reverse
@@ -196,6 +195,11 @@ func (c *Controller) generateAndLoadCaddyfile(ctx context.Context, containers []
 			}
 		}
 
+		if ctx.Err() != nil {
+			// The daemon is shutting down: don't overwrite the Caddyfile based on a possibly incomplete view.
+			return
+		}
+
 		// Caddy is not deployed on this machine (or no Caddyfile exists yet). Write a config without user-defined
 		// configs so that when Caddy is deployed on this machine, it can pick it up.
 		caddyfile, err := c.generator.Generate(ctx, containers, false)
@@ -266,14 +270,23 @@ func (c *Controller) caddyDeployedLocally(ctx context.Context) bool {
 		return true
 	}
 
-	result, err := c.docker.ListServiceContainers(ctx, CaddyServiceName, container.ListOptions{All: true})
+	// Only list, don't inspect: the existence of a caddy service container is all that matters here and a list
+	// call either succeeds or fails as a whole.
+	opts := container.ListOptions{
+		All: true,
+		Filters: filters.NewArgs(
+			filters.Arg("label", api.LabelManaged),
+			filters.Arg("label", api.LabelServiceName+"="+CaddyServiceName),
+		),
+	}
+	containers, err := c.docker.ContainerList(ctx, opts)
 	if err != nil {
 		c.log.Warn("Failed to list caddy service containers from Docker, assuming the caddy service is deployed "+
 			"on this machine.", "err", err)
 		return true
 	}
 
-	return len(result.Containers) > 0
+	return len(containers) > 0
 }
 
 // fingerprintContainers returns a fingerprint of containers that the Caddyfile generator depends on.
