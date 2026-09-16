@@ -41,8 +41,13 @@ http:// {
 (common_proxy) {
 	# Retry failed requests up to lb_retries times against other available upstreams.
 	lb_retries 3
-	# Upstreams are marked unhealthy for fail_duration after a failed request (passive health checking).
-	fail_duration 30s
+	# Passive health checking: an upstream is marked unhealthy for fail_duration only after max_fails failed
+	# requests within that window. A dead upstream fails every request and trips this in well under a second,
+	# while a client aborting its own request mid-stream (which Caddy also counts as an upstream failure) can't
+	# blacklist a healthy replica; with the previous max_fails=1 / 30s a couple of client aborts would take every
+	# replica of a service out of rotation and the whole site answered 503 "no upstreams available".
+	fail_duration 10s
+	max_fails 5
 }
 `
 
@@ -266,8 +271,13 @@ http:// {
 (common_proxy) {
 	# Retry failed requests up to lb_retries times against other available upstreams.
 	lb_retries 3
-	# Upstreams are marked unhealthy for fail_duration after a failed request (passive health checking).
-	fail_duration 30s
+	# Passive health checking: an upstream is marked unhealthy for fail_duration only after max_fails failed
+	# requests within that window. A dead upstream fails every request and trips this in well under a second,
+	# while a client aborting its own request mid-stream (which Caddy also counts as an upstream failure) can't
+	# blacklist a healthy replica; with the previous max_fails=1 / 30s a couple of client aborts would take every
+	# replica of a service out of rotation and the whole site answered 503 "no upstreams available".
+	fail_duration 10s
+	max_fails 5
 }
 `,
 		},
@@ -463,8 +473,13 @@ http:// {
 (common_proxy) {
 	# Retry failed requests up to lb_retries times against other available upstreams.
 	lb_retries 3
-	# Upstreams are marked unhealthy for fail_duration after a failed request (passive health checking).
-	fail_duration 30s
+	# Passive health checking: an upstream is marked unhealthy for fail_duration only after max_fails failed
+	# requests within that window. A dead upstream fails every request and trips this in well under a second,
+	# while a client aborting its own request mid-stream (which Caddy also counts as an upstream failure) can't
+	# blacklist a healthy replica; with the previous max_fails=1 / 30s a couple of client aborts would take every
+	# replica of a service out of rotation and the whole site answered 503 "no upstreams available".
+	fail_duration 10s
+	max_fails 5
 }
 
 # Sites generated from service ports.
@@ -705,8 +720,13 @@ http:// {
 (common_proxy) {
 	# Retry failed requests up to lb_retries times against other available upstreams.
 	lb_retries 3
-	# Upstreams are marked unhealthy for fail_duration after a failed request (passive health checking).
-	fail_duration 30s
+	# Passive health checking: an upstream is marked unhealthy for fail_duration only after max_fails failed
+	# requests within that window. A dead upstream fails every request and trips this in well under a second,
+	# while a client aborting its own request mid-stream (which Caddy also counts as an upstream failure) can't
+	# blacklist a healthy replica; with the previous max_fails=1 / 30s a couple of client aborts would take every
+	# replica of a service out of rotation and the whole site answered 503 "no upstreams available".
+	fail_duration 10s
+	max_fails 5
 }
 
 # Sites generated from service ports.
