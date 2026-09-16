@@ -24,7 +24,12 @@ func NewCaddyAdminClient(socketPath string) *CaddyAdminClient {
 	return &CaddyAdminClient{
 		socketPath: socketPath,
 		client: &http.Client{
-			Timeout: 5 * time.Second,
+			// Loading a config makes Caddy provision TLS for every site, and with a network storage module
+			// (e.g. redis) that is one round trip per certificate: measured ~4s for 43 sites on a small machine
+			// reaching redis on another provider. A 5s timeout made those loads "fail" client-side while Caddy
+			// completed them, so the Caddyfile was never written and the controller retried on every cluster
+			// event — and a timed-out adapt made it skip user-defined configs for that attempt.
+			Timeout: 60 * time.Second,
 			Transport: &http.Transport{
 				DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
 					return net.Dial("unix", socketPath)
