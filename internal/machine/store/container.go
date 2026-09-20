@@ -106,24 +106,36 @@ func normaliseContainerForStore(ctr *api.ServiceContainer) {
 		)
 	})
 
-	// Drop the healthcheck probe history. State.Health.Log holds the last few probe results with their timestamps
-	// and output, and FailingStreak counts consecutive failures, so both change on every single probe. Storing them
-	// would rewrite the container record on every probe interval, gossip that write to every machine in the cluster,
-	// and wake every subscriber (Caddy config and DNS controllers) to regenerate everything - for data nothing reads.
-	// Only Health.Status is consumed from the store: api.Container.Healthy()/HumanState(), cmd/uc/ps.go and
-	// pkg/client/container.go all read Status alone.
+	// Drop the fields that a healthcheck probe churns on every run. They would rewrite the container record on every
+	// probe interval, gossip that write to every machine in the cluster, and wake every subscriber (Caddy config and
+	// DNS controllers) to regenerate everything - for data nothing reads.
+	//
+	//   - ExecIDs: a Docker healthcheck is implemented as an exec, so this flips between ["<exec id>"] and null
+	//     depending on whether the periodic sync happens to catch a probe in flight. Nothing in the codebase reads
+	//     ExecIDs (verified by grep over pkg/, cmd/ and internal/).
+	//   - State.Health.Log: the last few probe results with their timestamps and output, so it changes on every probe.
+	//   - State.Health.FailingStreak: the count of consecutive failures.
+	//
+	// Health.Status is kept: it is the only health field consumed from the store, by
+	// api.Container.Healthy()/HumanState(), cmd/uc/ps.go and pkg/client/container.go.
+	//
 	// CreateOrUpdateContainer takes the container by value, but ContainerJSONBase, State and Health are pointers that
-	// the copy shares with the caller's container object. State lives in ContainerJSONBase, so even assigning a new
-	// State would write through the shared base. Copy all three structs down the chain before clearing the fields so
-	// that nothing the caller still uses is modified.
-	if ctr.ContainerJSONBase != nil && ctr.State != nil && ctr.State.Health != nil {
+	// the copy shares with the caller's container object. ExecIDs and State both live in ContainerJSONBase, so even
+	// assigning a new State would write through the shared base. Copy each struct down the chain before clearing its
+	// fields so that nothing the caller still uses is modified.
+	if ctr.ContainerJSONBase != nil {
 		base := *ctr.ContainerJSONBase
-		st := *base.State
-		h := *st.Health
-		h.Log = nil
-		h.FailingStreak = 0
-		st.Health = &h
-		base.State = &st
+		base.ExecIDs = nil
+
+		if base.State != nil && base.State.Health != nil {
+			st := *base.State
+			h := *st.Health
+			h.Log = nil
+			h.FailingStreak = 0
+			st.Health = &h
+			base.State = &st
+		}
+
 		ctr.ContainerJSONBase = &base
 	}
 }

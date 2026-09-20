@@ -19,7 +19,8 @@ func healthyContainer(failingStreak int, logs ...*container.HealthcheckResult) a
 		Container: api.Container{
 			InspectResponse: container.InspectResponse{
 				ContainerJSONBase: &container.ContainerJSONBase{
-					ID: "ctr1",
+					ID:      "ctr1",
+					ExecIDs: []string{"exec-abc"},
 					State: &container.State{
 						Status:  container.StateRunning,
 						Running: true,
@@ -57,6 +58,7 @@ func TestNormaliseContainerForStore_ClearsHealthChurn(t *testing.T) {
 	assert.Nil(t, ctr.State.Health.Log, "Health.Log must be cleared")
 	assert.Zero(t, ctr.State.Health.FailingStreak, "Health.FailingStreak must be cleared")
 	assert.Equal(t, container.Healthy, ctr.State.Health.Status, "Health.Status must be preserved")
+	assert.Nil(t, ctr.ExecIDs, "ExecIDs must be cleared")
 	// Unrelated State fields must survive.
 	assert.True(t, ctr.State.Running)
 	assert.Equal(t, container.StateRunning, ctr.State.Status)
@@ -78,7 +80,8 @@ func TestNormaliseContainerForStore_DoesNotMutateCaller(t *testing.T) {
 	require.Len(t, original.State.Health.Log, 1, "caller's Health.Log must be untouched")
 	assert.Equal(t, 1, original.State.Health.Log[0].ExitCode)
 	assert.Equal(t, 2, original.State.Health.FailingStreak, "caller's Health.FailingStreak must be untouched")
-	// State lives in the pointer-embedded ContainerJSONBase, so the whole chain must still be the caller's.
+	assert.Equal(t, []string{"exec-abc"}, original.ExecIDs, "caller's ExecIDs must be untouched")
+	// ExecIDs and State live in the pointer-embedded ContainerJSONBase, so the whole chain must still be the caller's.
 	assert.Same(t, originalBase, original.ContainerJSONBase)
 	assert.Same(t, originalState, original.State)
 	assert.Same(t, originalHealth, original.State.Health)
@@ -88,6 +91,7 @@ func TestNormaliseContainerForStore_DoesNotMutateCaller(t *testing.T) {
 	assert.NotSame(t, originalState, ctr.State)
 	assert.NotSame(t, originalHealth, ctr.State.Health)
 	assert.Nil(t, ctr.State.Health.Log)
+	assert.Nil(t, ctr.ExecIDs)
 }
 
 func TestNormaliseContainerForStore_HealthChurnDoesNotChangeJSON(t *testing.T) {
@@ -123,27 +127,33 @@ func TestNormaliseContainerForStore_NilStateAndHealth(t *testing.T) {
 	t.Parallel()
 
 	t.Run("nil state", func(t *testing.T) {
+		base := &container.ContainerJSONBase{ID: "ctr1", ExecIDs: []string{"exec-abc"}}
 		ctr := api.ServiceContainer{
 			Container: api.Container{
 				InspectResponse: container.InspectResponse{
-					ContainerJSONBase: &container.ContainerJSONBase{ID: "ctr1"},
+					ContainerJSONBase: base,
 					Config:            &container.Config{},
 				},
 			},
 		}
 		require.NotPanics(t, func() { normaliseContainerForStore(&ctr) })
 		assert.Nil(t, ctr.State)
+		// ExecIDs must be cleared even for a container with no health state at all.
+		assert.Nil(t, ctr.ExecIDs)
+		assert.Equal(t, []string{"exec-abc"}, base.ExecIDs, "caller's ExecIDs must be untouched")
 	})
 
 	t.Run("nil health", func(t *testing.T) {
+		base := &container.ContainerJSONBase{
+			ID:      "ctr1",
+			ExecIDs: []string{"exec-abc"},
+			State:   &container.State{Status: container.StateRunning, Running: true},
+		}
 		ctr := api.ServiceContainer{
 			Container: api.Container{
 				InspectResponse: container.InspectResponse{
-					ContainerJSONBase: &container.ContainerJSONBase{
-						ID:    "ctr1",
-						State: &container.State{Status: container.StateRunning, Running: true},
-					},
-					Config: &container.Config{},
+					ContainerJSONBase: base,
+					Config:            &container.Config{},
 				},
 			},
 		}
@@ -151,7 +161,38 @@ func TestNormaliseContainerForStore_NilStateAndHealth(t *testing.T) {
 		require.NotPanics(t, func() { normaliseContainerForStore(&ctr) })
 		assert.Same(t, state, ctr.State, "State must be left alone when there is no health data")
 		assert.Nil(t, ctr.State.Health)
+		assert.Nil(t, ctr.ExecIDs)
+		assert.Equal(t, []string{"exec-abc"}, base.ExecIDs, "caller's ExecIDs must be untouched")
 	})
+}
+
+func TestNormaliseContainerForStore_ExecIDsChurnDoesNotChangeJSON(t *testing.T) {
+	t.Parallel()
+
+	// A Docker healthcheck runs as an exec, so a sync that catches a probe in flight sees ExecIDs populated while
+	// the next sync sees it null. Both snapshots must serialise identically after normalisation.
+	probes := []*container.HealthcheckResult{probe(time.Unix(4000, 0).UTC(), 0)}
+	inFlight := healthyContainer(0, probes...)
+	inFlight.ExecIDs = []string{"7f3c1a2b4d5e"}
+	idle := healthyContainer(0, probes...)
+	idle.ExecIDs = nil
+
+	beforeInFlight, err := json.Marshal(inFlight)
+	require.NoError(t, err)
+	beforeIdle, err := json.Marshal(idle)
+	require.NoError(t, err)
+	require.NotEqual(t, string(beforeInFlight), string(beforeIdle),
+		"sanity check: ExecIDs must differ before normalisation")
+
+	normaliseContainerForStore(&inFlight)
+	normaliseContainerForStore(&idle)
+
+	afterInFlight, err := json.Marshal(inFlight)
+	require.NoError(t, err)
+	afterIdle, err := json.Marshal(idle)
+	require.NoError(t, err)
+	assert.Equal(t, string(afterInFlight), string(afterIdle),
+		"containers differing only in ExecIDs must serialise identically")
 }
 
 // recvSignal waits up to timeout for a signal and reports whether one was received.
