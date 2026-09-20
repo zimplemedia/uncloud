@@ -12,6 +12,7 @@ import (
 
 	sq "github.com/Masterminds/squirrel"
 	"github.com/docker/docker/api/types/container"
+	"github.com/psviderski/uncloud/internal/corrosion"
 	"github.com/psviderski/uncloud/pkg/api"
 )
 
@@ -23,6 +24,10 @@ const (
 	// SyncStatusOutdated indicates that a container record may be outdated, for example, due to being unable
 	// to retrieve the container's state from the Docker daemon or when the machine is being stopped or restarted.
 	SyncStatusOutdated = "outdated"
+
+	// containerChangesCoalesceDelay is how long change events are collected before a single change signal is emitted
+	// to the subscriber of the containers list.
+	containerChangesCoalesceDelay = 250 * time.Millisecond
 )
 
 type ContainerRecord struct {
@@ -100,6 +105,27 @@ func normaliseContainerForStore(ctr *api.ServiceContainer) {
 			strings.Compare(a.Source, b.Source),
 		)
 	})
+
+	// Drop the healthcheck probe history. State.Health.Log holds the last few probe results with their timestamps
+	// and output, and FailingStreak counts consecutive failures, so both change on every single probe. Storing them
+	// would rewrite the container record on every probe interval, gossip that write to every machine in the cluster,
+	// and wake every subscriber (Caddy config and DNS controllers) to regenerate everything - for data nothing reads.
+	// Only Health.Status is consumed from the store: api.Container.Healthy()/HumanState(), cmd/uc/ps.go and
+	// pkg/client/container.go all read Status alone.
+	// CreateOrUpdateContainer takes the container by value, but ContainerJSONBase, State and Health are pointers that
+	// the copy shares with the caller's container object. State lives in ContainerJSONBase, so even assigning a new
+	// State would write through the shared base. Copy all three structs down the chain before clearing the fields so
+	// that nothing the caller still uses is modified.
+	if ctr.ContainerJSONBase != nil && ctr.State != nil && ctr.State.Health != nil {
+		base := *ctr.ContainerJSONBase
+		st := *base.State
+		h := *st.Health
+		h.Log = nil
+		h.FailingStreak = 0
+		st.Health = &h
+		base.State = &st
+		ctr.ContainerJSONBase = &base
+	}
 }
 
 // ListContainers returns a list of container records from the store database that match the given options.
@@ -264,14 +290,17 @@ func (s *Store) SubscribeContainers(ctx context.Context) ([]ContainerRecord, <-c
 		return nil, nil, fmt.Errorf("get subscription changes: %w", err)
 	}
 
-	changes := make(chan struct{})
+	// Pass the change events through a goroutine that reports a subscription failure when the events channel closes,
+	// then coalesce them into change signals. Coalescing is done on the forwarded channel so that coalesceSignals
+	// stays free of subscription details and can be tested on its own.
+	forwarded := make(chan *corrosion.ChangeEvent)
 	go func() {
-		defer close(changes)
+		defer close(forwarded)
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case _, ok := <-events:
+			case e, ok := <-events:
 				if !ok {
 					// events channel has been closed.
 					if sub.Err() != nil {
@@ -279,11 +308,57 @@ func (s *Store) SubscribeContainers(ctx context.Context) ([]ContainerRecord, <-c
 					}
 					return
 				}
-				// Just signal that there is a change in the containers list.
-				changes <- struct{}{}
+				select {
+				case forwarded <- e:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
 	}()
 
-	return containers, changes, nil
+	return containers, coalesceSignals(ctx, forwarded, containerChangesCoalesceDelay), nil
+}
+
+// coalesceSignals converts a stream of change events into a stream of change signals, collapsing every burst of
+// events that occurs within delay of the first event of the burst into a single signal. A container change typically
+// arrives as several events (one per changed row) and consumers react by re-listing and regenerating everything
+// from scratch, so there is nothing to gain from signalling each event separately.
+//
+// The returned channel has a buffer of one and is written to with a non-blocking send: if a signal is still queued,
+// the consumer has not re-listed yet and that queued signal already guarantees a re-list that happens after the
+// dropped change, so no change is ever missed. The channel is closed when ctx is done or events is closed.
+func coalesceSignals(ctx context.Context, events <-chan *corrosion.ChangeEvent, delay time.Duration) <-chan struct{} {
+	signals := make(chan struct{}, 1)
+
+	go func() {
+		defer close(signals)
+
+		// A nil channel blocks forever, so delayC being non-nil means a burst is in progress.
+		var delayC <-chan time.Time
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case _, ok := <-events:
+				if !ok {
+					return
+				}
+				if delayC == nil {
+					// First event after a quiet period: start collecting the burst.
+					delayC = time.After(delay)
+				}
+			case <-delayC:
+				delayC = nil
+				select {
+				case signals <- struct{}{}:
+				default:
+					// A signal is already queued for the consumer; it will re-list after this change too.
+				}
+			}
+		}
+	}()
+
+	return signals
 }
