@@ -105,7 +105,7 @@ func newClusterController(
 		corroService:       corroService,
 		corrosionDir:       corrosionDir,
 		dockerService:      dockerService,
-		dockerCtrl:         docker.NewController(machine.state.ID, dockerService, store),
+		dockerCtrl:         docker.NewController(machine.state.ID, dockerService, store, machine.dockerDrainer),
 		dockerReady:        dockerReady,
 		syncMachineTrigger: make(chan struct{}, 1),
 		clusterReady:       clusterReady,

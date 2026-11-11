@@ -69,6 +69,8 @@ type Server struct {
 	networkReady func() bool
 	// waitForNetworkReady is a function that waits for the Docker network to be ready for containers.
 	waitForNetworkReady func(ctx context.Context) error
+	// drain takes service containers out of service discovery before StopContainer stops them. Nil or disabled = off.
+	drain *Drainer
 }
 
 type ServerOptions struct {
@@ -77,6 +79,8 @@ type ServerOptions struct {
 	//  API server but in this case we should probably fail until the cluster is initialised.
 	NetworkReady        func() bool
 	WaitForNetworkReady func(ctx context.Context) error
+	// Drainer drains service containers before StopContainer stops them (UNCLOUD_STOP_DRAIN). Nil or disabled = off.
+	Drainer *Drainer
 }
 
 // NewServer creates a new Docker gRPC server with the provided Docker service.
@@ -91,6 +95,7 @@ func NewServer(service *Service, db *sqlx.DB, internalDNSIP func() netip.Addr, m
 
 	s.networkReady = opts.NetworkReady
 	s.waitForNetworkReady = opts.WaitForNetworkReady
+	s.drain = opts.Drainer
 
 	return s
 }
@@ -178,6 +183,20 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 	return &emptypb.Empty{}, nil
 }
 
+// drainKey returns the drain registry key (the full container ID) for a container ID, short ID or name sent by
+// a client. Docker is only asked when the registry isn't empty and id isn't already a full ID; on an inspect error,
+// id is returned as is.
+func (s *Server) drainKey(ctx context.Context, id string) string {
+	if !s.drain.HasAny() || fullDockerIDRegex.MatchString(id) {
+		return id
+	}
+	ctr, err := s.client.ContainerInspect(ctx, id)
+	if err != nil {
+		return id
+	}
+	return ctr.ID
+}
+
 // StopContainer stops a container with the given ID and options.
 func (s *Server) StopContainer(ctx context.Context, req *pb.StopContainerRequest) (*emptypb.Empty, error) {
 	var opts container.StopOptions
@@ -185,6 +204,21 @@ func (s *Server) StopContainer(ctx context.Context, req *pb.StopContainerRequest
 		if err := json.Unmarshal(req.Options, &opts); err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "unmarshal options: %v", err)
 		}
+	}
+
+	if s.drain.Enabled() {
+		// Drain before stop: publish the container as not healthy, wait, then stop it with the same options.
+		if err := s.drain.StopContainer(ctx, req.Id, opts); err != nil {
+			if errdefs.IsNotFound(err) {
+				return nil, status.Error(codes.NotFound, err.Error())
+			}
+			if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+				// Cancelled during the drain wait, before the stop.
+				return nil, status.FromContextError(err).Err()
+			}
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+		return &emptypb.Empty{}, nil
 	}
 
 	if err := s.client.ContainerStop(ctx, req.Id, opts); err != nil {
@@ -259,12 +293,16 @@ func (s *Server) RemoveContainer(ctx context.Context, req *pb.RemoveContainerReq
 		}
 	}
 
+	// Resolve the drain registry key before the container is gone.
+	drainKey := s.drainKey(ctx, req.Id)
 	if err := s.client.ContainerRemove(ctx, req.Id, opts); err != nil {
 		if errdefs.IsNotFound(err) {
 			return nil, status.Error(codes.NotFound, err.Error())
 		}
 		return nil, status.Error(codes.Internal, err.Error())
 	}
+	// A removed container must not leak in the drain registry.
+	s.drain.Forget(drainKey)
 
 	return &emptypb.Empty{}, nil
 }
@@ -1123,6 +1161,7 @@ func (s *Server) RemoveServiceContainer(ctx context.Context, req *pb.RemoveConta
 	if err != nil {
 		return nil, err
 	}
+	s.drain.Forget(ctrID)
 
 	if _, err = s.db.ExecContext(ctx, `DELETE FROM containers WHERE id = $1`, ctrID); err != nil {
 		slog.Error("Failed to remove container from machine database.", "err", err, "id", ctrID)

@@ -12,6 +12,7 @@ import (
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
 	"github.com/psviderski/uncloud/internal/machine/store"
+	"github.com/psviderski/uncloud/pkg/api"
 )
 
 const (
@@ -23,21 +24,42 @@ const (
 	SyncInterval = 30 * time.Second
 )
 
+// containerStore is the subset of the cluster store used to sync this machine's containers.
+type containerStore interface {
+	ListContainers(ctx context.Context, opts store.ListOptions) ([]store.ContainerRecord, error)
+	DeleteContainers(ctx context.Context, opts store.DeleteOptions) error
+	CreateOrUpdateContainer(ctx context.Context, ctr api.ServiceContainer, machineID string) error
+}
+
+// serviceContainerLister lists the service containers on this machine from the Docker daemon.
+type serviceContainerLister interface {
+	ListServiceContainers(
+		ctx context.Context, serviceNameOrID string, opts container.ListOptions,
+	) (ListServiceContainersResult, error)
+}
+
 // Controller monitors Docker events and synchronises service containers with the cluster store.
 type Controller struct {
 	// machineID is the ID of the machine where the managed Docker daemon is running.
 	machineID string
 	client    *client.Client
 	service   *Service
-	store     *store.Store
+	store     containerStore
+	// lister lists the containers to sync. It's the service, replaced in tests.
+	lister serviceContainerLister
+	// drain applies the drain-before-stop override to the containers being drained and serialises the store writes
+	// with the drain marks. A nil or disabled Drainer changes nothing.
+	drain *Drainer
 }
 
-func NewController(machineID string, service *Service, store *store.Store) *Controller {
+func NewController(machineID string, service *Service, store *store.Store, drain *Drainer) *Controller {
 	return &Controller{
 		machineID: machineID,
 		client:    service.Client,
 		service:   service,
 		store:     store,
+		lister:    service,
+		drain:     drain,
 	}
 }
 
@@ -148,13 +170,26 @@ func (c *Controller) WatchAndSyncContainers(ctx context.Context) error {
 }
 
 func (c *Controller) syncContainersToStore(ctx context.Context) error {
+	// Hold the store write lock for the whole sync (list from Docker, then write) when drain before stop is on, so a
+	// sync that read a container's state before a drain mark can't overwrite the mark after it. No-op when off.
+	release, err := c.drain.lockWrites(ctx)
+	if err != nil {
+		return fmt.Errorf("wait for container store write lock: %w", err)
+	}
+	defer release()
+	// With the drain on, bound the work done under the lock so a hung Docker, machine DB or store call can't hold it
+	// forever; then retry the republishes that failed earlier. Both are no-ops when the drain is off.
+	ctx, cancel := c.drain.boundSync(ctx)
+	defer cancel()
+	c.drain.retryPendingLocked(ctx)
+
 	storeContainers, err := c.store.ListContainers(ctx, store.ListOptions{MachineIDs: []string{c.machineID}})
 	if err != nil {
 		return fmt.Errorf("list containers from store: %w", err)
 	}
 
 	// List containers for all services, including stopped ones and deployment hooks.
-	result, err := c.service.ListServiceContainers(ctx, "", container.ListOptions{All: true})
+	result, err := c.lister.ListServiceContainers(ctx, "", container.ListOptions{All: true})
 	if err != nil {
 		// TODO: mark all containers as outdated in the store.
 		return fmt.Errorf("list service containers: %w", err)
@@ -185,9 +220,10 @@ func (c *Controller) syncContainersToStore(ctx context.Context) error {
 		}
 	}
 
-	// Create or update the current Docker containers in the store.
+	// Create or update the current Docker containers in the store. A container being drained before stop is
+	// written as not healthy (publishView returns the container itself otherwise).
 	for _, ctr := range containers {
-		if err = c.store.CreateOrUpdateContainer(ctx, ctr, c.machineID); err != nil {
+		if err = c.store.CreateOrUpdateContainer(ctx, c.drain.publishView(ctr), c.machineID); err != nil {
 			storeErr = errors.Join(storeErr, fmt.Errorf("create or update container '%s': %w", ctr.ID, err))
 		}
 	}

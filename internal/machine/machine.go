@@ -183,6 +183,9 @@ type Machine struct {
 	// dockerService provides high-level operations for managing Docker containers.
 	dockerService *machinedocker.Service
 	dockerServer  *machinedocker.Server
+	// dockerDrainer drains service containers before they are stopped (UNCLOUD_STOP_DRAIN). Shared by the Docker
+	// gRPC server (StopContainer) and the Docker controller (container syncs to the store).
+	dockerDrainer *machinedocker.Drainer
 	// localMachineServer is the gRPC server for the machine API listening on the local Unix socket.
 	localMachineServer *grpc.Server
 
@@ -300,9 +303,24 @@ func NewMachine(config *Config) (*Machine, error) {
 	machineID := func() string {
 		return m.state.ID
 	}
+	stopDrain, err := machinedocker.ParseStopDrain(os.Getenv(machinedocker.StopDrainEnvVar))
+	if err != nil {
+		slog.Error("Invalid drain before stop setting, drain before stop is off.", "err", err)
+		stopDrain = 0
+	}
+	if stopDrain > 0 {
+		slog.Info("Drain before stop is on: a running, healthy service container with another healthy container "+
+			"of its service is published as not healthy and stopped after the drain time.",
+			"env", machinedocker.StopDrainEnvVar, "drain", stopDrain, "max", machinedocker.MaxStopDrain)
+	} else {
+		slog.Info("Drain before stop is off.", "env", machinedocker.StopDrainEnvVar)
+	}
+	m.dockerDrainer = machinedocker.NewDrainer(stopDrain, dockerService, corroStore, machineID)
+
 	m.dockerServer = machinedocker.NewServer(dockerService, db, internalDNSIP, machineID, machinedocker.ServerOptions{
 		NetworkReady:        m.IsNetworkReady,
 		WaitForNetworkReady: m.WaitForNetworkReady,
+		Drainer:             m.dockerDrainer,
 	})
 	caddyServer := caddyconfig.NewServer(caddyconfig.NewService(config.CaddyConfigDir))
 	m.localMachineServer = newGRPCServer(m, c, m.dockerServer, caddyServer)
