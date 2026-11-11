@@ -23,7 +23,8 @@ const (
 # Automatically updated on service or health status changes.
 # Docs: https://uncloud.run/docs/concepts/ingress/overview
 `
-	caddyfileTemplate = `# Health check endpoint to verify Caddy reachability on this machine.
+	// caddyfileBaseTemplate is the part of the generated Caddyfile that doesn't depend on the service ports.
+	caddyfileBaseTemplate = `# Health check endpoint to verify Caddy reachability on this machine.
 http:// {
 	handle {{.VerifyPath}} {
 		respond "{{.VerifyResponse}}" 200
@@ -42,6 +43,9 @@ http:// {
 	fail_duration 10s
 	max_fails 5
 }
+`
+	// caddyfileIPSitesTemplate renders the sites generated from service ports with the container IPs as upstreams.
+	caddyfileIPSitesTemplate = `
 {{- if or .HTTPHostUpstreams .HTTPSHostUpstreams }}
 
 # Sites generated from service ports.{{end}}
@@ -62,6 +66,34 @@ https://{{$hostname}} {
 	log
 }{{end}}
 `
+	// caddyfileDNSSitesTemplate renders the sites generated from service ports with 'dynamic a' upstreams resolved
+	// through the uncloud internal DNS, so replacing a service container doesn't change the Caddyfile.
+	caddyfileDNSSitesTemplate = `
+{{- if or .HTTPHostUpstreams .HTTPSHostUpstreams }}
+
+# Sites generated from service ports.{{end}}
+{{- range $hostname, $targets := .HTTPHostUpstreams}}
+
+http://{{$hostname}} {
+	reverse_proxy {
+{{dnsUpstreams $targets}}
+		import common_proxy
+	}
+	log
+}{{end}}
+{{- range $hostname, $targets := .HTTPSHostUpstreams}}
+
+https://{{$hostname}} {
+	reverse_proxy {
+{{dnsUpstreams $targets}}
+		import common_proxy
+	}
+	log
+}{{end}}
+`
+	caddyfileTemplate    = caddyfileBaseTemplate + caddyfileIPSitesTemplate
+	caddyfileDNSTemplate = caddyfileBaseTemplate + caddyfileDNSSitesTemplate
+
 	caddyfileUnavailabeFooter = `# NOTE: User-defined configs for services were skipped because Caddy is not running on this machine
 #       (not accessible via the shared admin socket /run/uncloud/caddy/admin.sock) or the latest
 #       generated config is invalid. Please check the service 'caddy' is running (uc inspect caddy)
@@ -77,6 +109,9 @@ type CaddyfileGenerator struct {
 	machineName string
 	validator   CaddyfileValidator
 	log         *slog.Logger
+	// dnsUpstreams makes the sites generated from service ports use 'dynamic a' upstreams resolved through the
+	// uncloud internal DNS instead of container IPs. See DNSUpstreamsEnvVar.
+	dnsUpstreams bool
 }
 
 // CaddyfileValidator is an interface for validating Caddyfile configurations.
@@ -271,6 +306,10 @@ func (g *CaddyfileGenerator) localMachineRank(machineID string) int {
 }
 
 func (g *CaddyfileGenerator) generateBaseFromPorts(containers []api.ServiceContainer) (string, error) {
+	if g.dnsUpstreams {
+		return g.generateBaseFromPortsDNS(containers)
+	}
+
 	httpHostUpstreams, httpsHostUpstreams := httpUpstreamsFromPorts(containers)
 
 	funcs := template.FuncMap{"join": strings.Join}
@@ -297,6 +336,117 @@ func (g *CaddyfileGenerator) generateBaseFromPorts(containers []api.ServiceConta
 	}
 
 	return buf.String(), nil
+}
+
+// generateBaseFromPortsDNS is generateBaseFromPorts for the DNS upstreams mode: each generated site proxies to
+// 'dynamic a <service>.internal. <port>' upstreams instead of container IPs.
+func (g *CaddyfileGenerator) generateBaseFromPortsDNS(containers []api.ServiceContainer) (string, error) {
+	httpHostTargets, httpsHostTargets := httpDNSTargetsFromPorts(containers)
+
+	funcs := template.FuncMap{"dnsUpstreams": formatDNSUpstreams}
+	tmpl, err := template.New("Caddyfile").Funcs(funcs).Parse(caddyfileDNSTemplate)
+	if err != nil {
+		return "", fmt.Errorf("parse Caddyfile template: %w", err)
+	}
+
+	data := struct {
+		VerifyPath         string
+		VerifyResponse     string
+		HTTPHostUpstreams  map[string][]dnsTarget
+		HTTPSHostUpstreams map[string][]dnsTarget
+	}{
+		VerifyPath:         VerifyPath,
+		VerifyResponse:     g.machineID,
+		HTTPHostUpstreams:  httpHostTargets,
+		HTTPSHostUpstreams: httpsHostTargets,
+	}
+
+	var buf bytes.Buffer
+	if err = tmpl.Execute(&buf, data); err != nil {
+		return "", fmt.Errorf("execute Caddyfile template: %w", err)
+	}
+
+	return buf.String(), nil
+}
+
+// dnsTarget is a service port that a generated site proxies to in the DNS upstreams mode.
+type dnsTarget struct {
+	Service string
+	Port    uint16
+}
+
+// httpDNSTargetsFromPorts is httpUpstreamsFromPorts for the DNS upstreams mode. It maps hostnames to the
+// (service, container port) pairs published for them instead of container IP:port pairs. The pairs are deduplicated
+// and sorted so the result doesn't depend on the number or order of the containers: replacing a container with
+// another one of the same service and ports gives the same result. It's expected that all containers are healthy.
+func httpDNSTargetsFromPorts(containers []api.ServiceContainer) (map[string][]dnsTarget, map[string][]dnsTarget) {
+	httpHostTargets := make(map[string][]dnsTarget)
+	httpsHostTargets := make(map[string][]dnsTarget)
+	for _, ctr := range containers {
+		// Skip the same containers as httpUpstreamsFromPorts and the uncloud DNS resolver: the DNS name only
+		// resolves to containers connected to the uncloud Docker network.
+		if !ctr.UncloudNetworkIP().IsValid() {
+			continue
+		}
+		serviceName := ctr.ServiceName()
+		if serviceName == "" {
+			continue
+		}
+		log := slog.With("container", ctr.ID)
+
+		ports, err := ctr.ServicePorts()
+		if err != nil {
+			log.Error("Failed to parse service ports for container.", "err", err)
+			continue
+		}
+
+		for _, port := range ports {
+			if port.Mode != api.PortModeIngress {
+				continue
+			}
+
+			target := dnsTarget{Service: serviceName, Port: port.ContainerPort}
+			switch port.Protocol {
+			case api.ProtocolHTTP:
+				httpHostTargets[port.Hostname] = append(httpHostTargets[port.Hostname], target)
+			case api.ProtocolHTTPS:
+				httpsHostTargets[port.Hostname] = append(httpsHostTargets[port.Hostname], target)
+			default:
+				// TODO: implement L4 ingress routing for TCP and UDP.
+				log.Error("Unsupported protocol for ingress port.", "port", port)
+				continue
+			}
+		}
+	}
+
+	for _, hostTargets := range []map[string][]dnsTarget{httpHostTargets, httpsHostTargets} {
+		for hostname, targets := range hostTargets {
+			slices.SortFunc(targets, func(a, b dnsTarget) int {
+				return cmp.Or(strings.Compare(a.Service, b.Service), cmp.Compare(a.Port, b.Port))
+			})
+			hostTargets[hostname] = slices.Compact(targets)
+		}
+	}
+
+	return httpHostTargets, httpsHostTargets
+}
+
+// formatDNSUpstreams renders the upstream source lines of a generated site's reverse_proxy block for the given
+// targets: a single 'dynamic a' source or, when several services or ports share the hostname, a 'dynamic multi'
+// source with an 'a' source per target. The lines are indented to sit inside 'reverse_proxy {' of a site block.
+func formatDNSUpstreams(targets []dnsTarget) string {
+	const indent = "\t\t"
+	if len(targets) == 1 {
+		return indent + dynamicABlock("dynamic a", targets[0].Service, int(targets[0].Port), indent)
+	}
+
+	var b strings.Builder
+	b.WriteString(indent + "dynamic multi {\n")
+	for _, t := range targets {
+		b.WriteString(indent + "\t" + dynamicABlock("a", t.Service, int(t.Port), indent+"\t") + "\n")
+	}
+	b.WriteString(indent + "}")
+	return b.String()
 }
 
 // httpUpstreamsFromPorts extracts upstreams for HTTP and HTTPS protocols from the published ports of the provided
@@ -360,10 +510,11 @@ func serviceUpstreams(containers []api.ServiceContainer) map[string][]string {
 	return upstreams
 }
 
-// renderCaddyfile renders a Caddyfile template with the upstreams function and data.
+// renderCaddyfile renders a Caddyfile template with the upstreams and dynamic_upstreams functions and data.
 func renderCaddyfile(tmplCtx templateContext, caddyfile string) (string, error) {
 	funcs := template.FuncMap{
-		"upstreams": upstreamsTemplateFn(tmplCtx),
+		"upstreams":         upstreamsTemplateFn(tmplCtx),
+		"dynamic_upstreams": dynamicUpstreamsTemplateFn(tmplCtx),
 	}
 
 	tmpl, err := template.New("Caddyfile").Funcs(funcs).Parse(caddyfile)
@@ -376,5 +527,5 @@ func renderCaddyfile(tmplCtx templateContext, caddyfile string) (string, error) 
 		return "", fmt.Errorf("execute template: %w", err)
 	}
 
-	return buf.String(), nil
+	return expandIndentMarkers(buf.String()), nil
 }

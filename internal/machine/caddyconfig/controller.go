@@ -22,7 +22,17 @@ const (
 	CaddyServiceName = "caddy"
 	CaddyGroup       = "uncloud"
 	VerifyPath       = "/.uncloud-verify"
+	// DNSUpstreamsEnvVar is the daemon environment variable that switches the sites generated from service ports to
+	// 'dynamic a' upstreams resolved through the uncloud internal DNS when set to "1". Any other value or unset keeps
+	// the container IPs as upstreams. With DNS upstreams, replacing a service container doesn't change the Caddyfile,
+	// so Caddy doesn't reload. It's read once when the daemon starts.
+	DNSUpstreamsEnvVar = "UNCLOUD_CADDY_DNS_UPSTREAMS"
 )
+
+// dnsUpstreamsEnabled returns whether the DNS upstreams mode is enabled by the given DNSUpstreamsEnvVar value.
+func dnsUpstreamsEnabled(value string) bool {
+	return value == "1"
+}
 
 // LocalContainerLister lists containers on this machine directly from the Docker daemon (the subset of the Docker
 // client used by the controller). It's the source of truth for whether the caddy service is deployed on the machine:
@@ -43,6 +53,8 @@ type Controller struct {
 	store         *store.Store
 	docker        LocalContainerLister
 	log           *slog.Logger
+	// dnsUpstreams is passed to the generator, see DNSUpstreamsEnvVar.
+	dnsUpstreams bool
 	// lastFingerprint caches the fingerprint of the containers used to generate the latest successfully loaded
 	// Caddyfile. nil means it hasn't been loaded yet or the last load failed.
 	lastFingerprint []containerFingerprint
@@ -82,6 +94,15 @@ func NewController(
 	log := slog.With("component", "caddy-controller")
 	client := NewCaddyAdminClient(adminSock)
 
+	dnsUpstreams := dnsUpstreamsEnabled(os.Getenv(DNSUpstreamsEnvVar))
+	if dnsUpstreams {
+		log.Info("Sites generated from service ports use DNS upstreams (dynamic a <service>.internal.).",
+			"env", DNSUpstreamsEnvVar, "mode", "dns")
+	} else {
+		log.Info("Sites generated from service ports use container IP upstreams.",
+			"env", DNSUpstreamsEnvVar, "mode", "ip")
+	}
+
 	// generator is initialised by Run() once the machine name is resolved from the store.
 	return &Controller{
 		machineID:     machineID,
@@ -90,6 +111,7 @@ func NewController(
 		store:         store,
 		docker:        docker,
 		log:           log,
+		dnsUpstreams:  dnsUpstreams,
 	}, nil
 }
 
@@ -104,6 +126,7 @@ func (c *Controller) Run(ctx context.Context) error {
 		machineName = m.Name
 	}
 	c.generator = NewCaddyfileGenerator(c.machineID, machineName, c.client, c.log)
+	c.generator.dnsUpstreams = c.dnsUpstreams
 
 	containers, changes, err := c.store.SubscribeContainers(ctx)
 	if err != nil {
